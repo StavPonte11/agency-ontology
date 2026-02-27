@@ -1,0 +1,56 @@
+{
+    "mappings": {
+        "properties": {
+            "chunk_id": {
+                "type": "keyword"
+            },
+            "document_id": {
+                "type": "keyword"
+            },
+            "concept_ids": {
+                "type": "keyword"
+            },
+            "content": {
+                "type": "text",
+                "analyzer": "standard"
+            },
+            "section_title": {
+                "type": "text",
+                "analyzer": "standard",
+                "fields": {
+                    "keyword": {
+                        "type": "keyword"
+                    }
+                }
+            },
+            "page_range": {
+                "type": "keyword"
+            },
+            "connector_id": {
+                "type": "keyword"
+            },
+            "document_title": {
+                "type": "text",
+                "analyzer": "standard"
+            },
+            "created_at": {
+                "type": "date"
+            },
+            "embedding": {
+                "type": "dense_vector",
+                "dims": 1024,
+                "index": true,
+                "similarity": "cosine",
+                "index_options": {
+                    "type": "hnsw",
+                    "m": 16,
+                    "ef_construction": 100
+                }
+            }
+        }
+    },
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0
+    }
+}

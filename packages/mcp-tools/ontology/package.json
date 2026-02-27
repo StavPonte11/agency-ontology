@@ -1,0 +1,11 @@
+{
+    "name": "agency-ontology-mcp-tools",
+    "version": "1.0.0",
+    "private": true,
+    "main": "index.ts",
+    "dependencies": {
+        "agency-ontology-shared-types": "*",
+        "zod": "^3.22.4",
+        "zod-to-json-schema": "^3.22.4"
+    }
+}

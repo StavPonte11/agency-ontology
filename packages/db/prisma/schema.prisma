@@ -1,0 +1,171 @@
+// generator client {
+//   provider = "prisma-client-js"
+// }
+// datasource db {
+//   provider = "postgresql"
+//   url      = env("DATABASE_URL")
+// }
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── OntologyEvent ─────────────────────────────────────────────────────────────
+// Event store — every change to the knowledge graph is recorded here FIRST.
+// Changes are applied to Neo4j only after PostgreSQL commit.
+// This enables full audit history and point-in-time recovery.
+model OntologyEvent {
+  id             String    @id @default(uuid())
+  eventType      String    // CONCEPT_CREATED | CONCEPT_UPDATED | CONCEPT_DEPRECATED |
+                           // TERM_ADDED | RELATIONSHIP_ADDED | DATA_MAPPING_ADDED | etc.
+  entityType     String    // Concept | Term | DataAsset | Relationship
+  entityId       String    // The affected entity UUID
+  payload        Json      // Full snapshot of entity state
+  actorType      String    // PIPELINE | HUMAN | AGENT | SYSTEM
+  actorId        String?   // User ID, Agent ID, or Job ID
+  sessionId      String?
+  appliedToNeo4j Boolean   @default(false)
+  appliedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([entityId])
+  @@index([eventType])
+  @@index([createdAt])
+  @@index([appliedToNeo4j])
+  @@map("ontology_events")
+}
+
+// ── ReviewItem ────────────────────────────────────────────────────────────────
+// Human review queue — low-confidence or conflicting extractions land here.
+model ReviewItem {
+  id             String    @id @default(uuid())
+  itemType       String    // CONCEPT | RELATIONSHIP | DATA_MAPPING | CONFLICT
+  status         String    @default("PENDING") // PENDING | IN_REVIEW | APPROVED | REJECTED | MERGED
+  priority       String    @default("MEDIUM")  // LOW | MEDIUM | HIGH | CRITICAL
+  sourceJobId    String
+  payload        Json      // The extracted entity awaiting review
+  autoExtracted  Json      // Raw LLM output (for reference)
+  sourceEvidence Json      // source_quote and document reference
+  conflictsWith  String[]  // IDs of existing concepts/relationships that conflict
+  similarTo      Json?     // Similar existing concepts (for dedup review)
+  assignedTo     String?
+  reviewedBy     String?
+  reviewedAt     DateTime?
+  reviewerNotes  String?
+  resolution     Json?     // How it was resolved: {action: APPROVE|REJECT|MERGE, mergeTargetId?: string}
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([status, priority])
+  @@index([sourceJobId])
+  @@index([status])
+  @@map("review_items")
+}
+
+// ── IngestionJob ──────────────────────────────────────────────────────────────
+// Tracks all pipeline execution jobs.
+model IngestionJob {
+  id              String    @id @default(uuid())
+  connectorId     String
+  connectorType   String
+  sourceRef       String    // Document path / URL / external ID
+  sourceHash      String?   // SHA-256 of source content — used for deduplication
+  status          String    @default("QUEUED")
+                            // QUEUED | RUNNING | EXTRACTING | RESOLVING | REVIEW | COMMITTED | FAILED | SKIPPED
+  progress        Json?     // { stage: string, pct: int, processed: int, total: int }
+  stats           Json?     // { concepts_extracted, terms_extracted, relationships_extracted, review_items, conflicts, errors }
+  errorLog        Json?     // Array of { stage, error, timestamp }
+  kafkaOffset     BigInt?   // Kafka offset of last processed message — enables precise replay
+  langfuseTraceId String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([connectorId, status])
+  @@index([sourceHash])
+  @@index([status])
+  @@index([createdAt])
+  @@map("ingestion_jobs")
+}
+
+// ── SourceConnector ───────────────────────────────────────────────────────────
+// Registered source connectors (PDF dirs, OpenMetadata, custom APIs, etc.)
+model SourceConnector {
+  id             String    @id @default(uuid())
+  connectorType  String    // PDF | OPENMETADATA | CUSTOM_API | CONFLUENCE | GIT
+  name           String
+  description    String?
+  config         Json      // Connector-specific config.
+                           // IMPORTANT: encrypt sensitive fields (tokens, passwords) at app layer
+                           // before storing. Never store plaintext credentials here.
+                           // TODO(security): Integrate with Secret Manager / Vault.
+  enabled        Boolean   @default(true)
+  schedule       String?   // Cron expression for auto-scheduled runs
+  lastRunAt      DateTime?
+  lastRunStatus  String?   // COMPLETED | FAILED | PARTIAL
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([connectorType, enabled])
+  @@map("source_connectors")
+}
+
+// ── OntologyFeedback ──────────────────────────────────────────────────────────
+// Agent and user feedback on ontology quality.
+// High-volume: agents call the feedback endpoint frequently.
+model OntologyFeedback {
+  id           String   @id @default(uuid())
+  conceptId    String   // UUID of the concept in Neo4j
+  feedbackType String   // POSITIVE | NEGATIVE | INCORRECT | INCOMPLETE | WRONG_MAPPING | OUTDATED
+  agentId      String?
+  userId       String?
+  sessionId    String?
+  traceId      String?  // LangFuse trace ID for correlation
+  context      String?  // The query/task context in which feedback was given
+  notes        String?
+  resolved     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  @@index([conceptId])
+  @@index([resolved])
+  @@index([feedbackType])
+  @@index([createdAt])
+  @@map("ontology_feedback")
+}
+
+// ── ConceptChangeLog ──────────────────────────────────────────────────────────
+// Full change history for each concept — who changed what and when.
+model ConceptChangeLog {
+  id          String   @id @default(uuid())
+  conceptId   String
+  changeType  String   // FIELD_UPDATE | STATUS_CHANGE | MERGE | DEPRECATION | TERM_ADDED
+  before      Json     // Concept state before change
+  after       Json     // Concept state after change
+  actorType   String   // PIPELINE | HUMAN | AGENT | SYSTEM
+  actorId     String?
+  createdAt   DateTime @default(now())
+
+  @@index([conceptId, createdAt])
+  @@index([changeType])
+  @@map("concept_change_log")
+}
+
+// ── EmbeddingCache ────────────────────────────────────────────────────────────
+// Cached embeddings keyed by text hash — avoids redundant embedding calls.
+// Primary cache is Redis (TTL-based); this is the persistent backing store.
+model EmbeddingCache {
+  id         String   @id @default(uuid())
+  textHash   String   @unique  // SHA-256 of the text
+  model      String            // Embedding model name
+  embedding  Bytes             // Binary-encoded float array (msgpack or numpy format)
+  dims       Int
+  createdAt  DateTime @default(now())
+
+  @@index([textHash])
+  @@map("embedding_cache")
+}

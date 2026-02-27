@@ -1,0 +1,23 @@
+{
+    "name": "agency-ontology",
+    "version": "1.0.0",
+    "private": true,
+    "workspaces": [
+        "apps/portal",
+        "packages/shared-types",
+        "packages/mcp-tools/ontology"
+    ],
+    "scripts": {
+        "dev": "npm run dev --workspace=apps/portal",
+        "build": "npm run build --workspace=apps/portal",
+        "lint": "npm run lint --workspace=apps/portal",
+        "test:e2e": "npx playwright test",
+        "test:load": "k6 run tests/load/k6_script.js"
+    },
+    "devDependencies": {
+        "@playwright/test": "^1.43.0",
+        "@vitejs/plugin-react": "^4.2.1",
+        "typescript": "^5.4.5",
+        "vitest": "^1.5.0"
+    }
+}

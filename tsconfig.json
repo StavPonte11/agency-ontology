@@ -1,0 +1,24 @@
+{
+    "compilerOptions": {
+        "target": "ES2020",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "strict": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "paths": {
+            "agency-ontology-shared-types": [
+                "./packages/shared-types/ontology.ts"
+            ]
+        }
+    },
+    "include": [
+        "packages/**/*.ts"
+    ],
+    "exclude": [
+        "node_modules",
+        "apps",
+        "**/node_modules",
+        "**/.next"
+    ]
+}

@@ -1,0 +1,206 @@
+{
+    "description": "Evaluation dataset for Agency Ontology — ingestion pipeline and context enrichment. Hebrew military-operational domain.",
+    "version": "1.0.0",
+    "ingestion_test_cases": [
+        {
+            "id": "ING-001",
+            "description": "Basic term resolution — common military unit abbreviation",
+            "input_text": "קמ\"ן האוגדה אישר את פקודת הגיוס לכוחות המילואים.",
+            "expected_concepts": [
+                {
+                    "nameHe": "קמ\"ן",
+                    "type": "ROLE",
+                    "descriptionHe_contains": "קצין מודיעין",
+                    "acronym": true
+                },
+                {
+                    "nameHe": "אוגדה",
+                    "type": "UNIT"
+                },
+                {
+                    "nameHe": "מילואים",
+                    "type": "UNIT"
+                }
+            ],
+            "expected_relations": [
+                {
+                    "from": "קמ\"ן",
+                    "relation": "PART_OF",
+                    "to": "אוגדה"
+                }
+            ]
+        },
+        {
+            "id": "ING-002",
+            "description": "Acronym disambiguation — שח\"ר has two meanings in different contexts",
+            "input_text": "מערכת שח\"ר מיועדת לשילוב חרדים בשירות הצבאי.",
+            "expected_concepts": [
+                {
+                    "nameHe": "שח\"ר",
+                    "type": "SYSTEM",
+                    "descriptionHe_contains": "חרדים",
+                    "conflict_expected": true,
+                    "conflict_reason": "ראשי תיבות עם מספר פירושים אפשריים"
+                }
+            ]
+        },
+        {
+            "id": "ING-003",
+            "description": "Sensitivity classification — SECRET-level content mentioned",
+            "input_text": "פרטי מבצע 'ענבי זעם' מסווגים כסודי ביותר ואינם להפצה.",
+            "expected_concepts": [
+                {
+                    "nameHe": "ענבי זעם",
+                    "type": "CODENAME",
+                    "sensitivity": "SECRET"
+                }
+            ]
+        },
+        {
+            "id": "ING-004",
+            "description": "System > process chain extraction",
+            "input_text": "מערכת צי\"ד מחוברת לרשת ה-C4I ומפיקה דוחות מצב לפיקוד המבצעי.",
+            "expected_concepts": [
+                {
+                    "nameHe": "מערכת צי\"ד",
+                    "type": "SYSTEM"
+                },
+                {
+                    "nameHe": "C4I",
+                    "type": "SYSTEM",
+                    "nameEn": "C4I"
+                },
+                {
+                    "nameHe": "פיקוד מבצעי",
+                    "type": "UNIT"
+                }
+            ],
+            "expected_relations": [
+                {
+                    "from": "מערכת צי\"ד",
+                    "relation": "PART_OF",
+                    "to": "C4I"
+                },
+                {
+                    "from": "מערכת צי\"ד",
+                    "relation": "PRODUCES",
+                    "to": "דוח מצב"
+                }
+            ]
+        },
+        {
+            "id": "ING-005",
+            "description": "Regulation -> System governance link",
+            "input_text": "על פי פקודת מטכ\"ל 33.0119, כל מערכת שדה חייבת לעמוד בתקן אבטחה רמה ג'.",
+            "expected_concepts": [
+                {
+                    "nameHe": "פקודת מטכ\"ל 33.0119",
+                    "type": "REGULATION"
+                },
+                {
+                    "nameHe": "מערכת שדה",
+                    "type": "SYSTEM"
+                }
+            ],
+            "expected_relations": [
+                {
+                    "from": "פקודת מטכ\"ל 33.0119",
+                    "relation": "GOVERNS",
+                    "to": "מערכת שדה"
+                }
+            ]
+        },
+        {
+            "id": "ING-006",
+            "description": "Data asset mapping — table to business concept",
+            "input_text": "טבלת idf.order_of_battle מכילה את נתוני סדר כוחות (סד\"כ) הממשי.",
+            "expected_concepts": [
+                {
+                    "nameHe": "סד\"כ",
+                    "type": "TERM",
+                    "descriptionHe_contains": "סדר כוחות"
+                }
+            ],
+            "expected_data_assets": [
+                {
+                    "qualified_name": "idf.order_of_battle",
+                    "asset_type": "TABLE",
+                    "mapped_to": "סד\"כ"
+                }
+            ]
+        },
+        {
+            "id": "ING-007",
+            "description": "Nikud stripping — same term with and without diacritics should resolve to same concept",
+            "input_text": "מַעֲרֶכֶת הַשְּׁלִיטָה הַמַּרְכָּזִית משמשת לתיאום בין חטיבות.",
+            "expected_concepts": [
+                {
+                    "nameHe": "מערכת השליטה המרכזית",
+                    "type": "SYSTEM",
+                    "note": "nikud must be stripped for lookup"
+                }
+            ]
+        }
+    ],
+    "enrichment_test_cases": [
+        {
+            "id": "ENR-001",
+            "description": "Agent enrichment — disambiguate abbreviation before query",
+            "agent_prompt": "כמה חיילים שייכים ל-אגמ\"ם?",
+            "expected_enrichment_context_contains": [
+                "אגמ\"ם",
+                "אגף המבצעים"
+            ],
+            "expected_data_assets_hint": [
+                "idf.personnel"
+            ]
+        },
+        {
+            "id": "ENR-002",
+            "description": "TextToSQL — context enrichment should return table names",
+            "agent_prompt": "כמה מילואמניקים שירתו החודש בחטיבה 7?",
+            "expected_enrichment_context_contains": [
+                "מילואים",
+                "חטיבה"
+            ],
+            "expected_data_assets_hint": [
+                "idf.reserve_service",
+                "idf.unit_roster"
+            ]
+        },
+        {
+            "id": "ENR-003",
+            "description": "Lookup fallback — unknown new acronym should return top candidates",
+            "agent_prompt": "מהו המיג\"ד?",
+            "expected_enrichment": {
+                "found": false,
+                "closest_candidates_include": [
+                    "מג\"ד",
+                    "מ\"פ"
+                ]
+            }
+        },
+        {
+            "id": "ENR-004",
+            "description": "Sensitivity filter — SECRET concepts must not leak to low-clearance agents",
+            "agent_prompt": "מה הסטטוס של מבצע ענבי זעם?",
+            "required_agent_clearance": "SECRET",
+            "expected_behavior_without_clearance": "concept NOT returned in results",
+            "expected_behavior_with_clearance": "concept returned with full metadata"
+        },
+        {
+            "id": "ENR-005",
+            "description": "Multi-hop traversal — from role to unit to data asset",
+            "agent_prompt": "מי אחראי על נתוני אוגדה 162 במערכת ה-ERP?",
+            "expected_enrichment_context_contains": [
+                "אוגדה 162",
+                "קמ\"ן"
+            ],
+            "expected_graph_hops": 2,
+            "expected_data_assets_hint": [
+                "idf.division_personnel",
+                "idf.unit_erp"
+            ]
+        }
+    ]
+}

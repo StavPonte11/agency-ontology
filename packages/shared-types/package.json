@@ -1,0 +1,13 @@
+{
+    "name": "agency-ontology-shared-types",
+    "version": "1.0.0",
+    "private": true,
+    "main": "./ontology.ts",
+    "types": "./ontology.ts",
+    "dependencies": {
+        "zod": "^3.22.4"
+    },
+    "devDependencies": {
+        "typescript": "^5.4.5"
+    }
+}

@@ -1,0 +1,141 @@
+{
+  "mappings": {
+    "properties": {
+      "concept_id": {
+        "type": "keyword"
+      },
+      "name": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "name_he": {
+        "type": "text",
+        "analyzer": "standard"
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "standard"
+      },
+      "description_he": {
+        "type": "text",
+        "analyzer": "standard"
+      },
+      "aliases": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "concept_type": {
+        "type": "keyword"
+      },
+      "domain": {
+        "type": "keyword"
+      },
+      "status": {
+        "type": "keyword"
+      },
+      "sensitivity": {
+        "type": "keyword"
+      },
+      "confidence": {
+        "type": "float"
+      },
+      "sources": {
+        "type": "keyword"
+      },
+      "usage_count": {
+        "type": "integer"
+      },
+      "created_at": {
+        "type": "date"
+      },
+      "updated_at": {
+        "type": "date"
+      },
+      "last_used_at": {
+        "type": "date"
+      },
+      "verified_by": {
+        "type": "keyword"
+      },
+      "embedding": {
+        "type": "dense_vector",
+        "dims": 1024,
+        "index": true,
+        "similarity": "cosine",
+        "index_options": {
+          "type": "hnsw",
+          "m": 16,
+          "ef_construction": 100
+        }
+      }
+    }
+  },
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "analysis": {
+      "char_filter": {
+        "hebrew_nikud_filter": {
+          "type": "pattern_replace",
+          "pattern": "[\\u05B0-\\u05C7]",
+          "replacement": ""
+        }
+      },
+      "tokenizer": {
+        "hebrew_edge_ngram": {
+          "type": "edge_ngram",
+          "min_gram": 2,
+          "max_gram": 20,
+          "token_chars": [
+            "letter",
+            "digit"
+          ]
+        }
+      },
+      "filter": {
+        "hebrew_length": {
+          "type": "length",
+          "min": 2,
+          "max": 50
+        }
+      },
+      "analyzer": {
+        "hebrew_military": {
+          "type": "custom",
+          "char_filter": [
+            "hebrew_nikud_filter"
+          ],
+          "tokenizer": "standard",
+          "filter": [
+            "lowercase",
+            "hebrew_length"
+          ]
+        },
+        "hebrew_military_search": {
+          "type": "custom",
+          "char_filter": [
+            "hebrew_nikud_filter"
+          ],
+          "tokenizer": "standard",
+          "filter": [
+            "lowercase"
+          ]
+        },
+        "standard": {
+          "type": "standard",
+          "stopwords": "_none_"
+        }
+      }
+    }
+  }
+}
