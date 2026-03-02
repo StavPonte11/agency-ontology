@@ -25,7 +25,9 @@ from services.retrieval_api.routers import (
     enrich,
     schema_context,
     feedback,
+    impact,
 )
+from services.retrieval_api.services.impact_service import ImpactService
 from services.retrieval_api.services.cache_service import CacheService
 from services.retrieval_api.services.circuit_breaker import CircuitBreakerRegistry
 from services.retrieval_api.services.circuit_breaker import EmbeddingService
@@ -75,6 +77,18 @@ async def lifespan(app: FastAPI):
         }
     )
 
+    # Impact Analysis Service
+    try:
+        app.state.impact = await ImpactService.create(
+            uri=settings.neo4j_uri,
+            user=settings.neo4j_user,
+            password=settings.neo4j_password,
+        )
+        logger.info("ImpactService initialized — impact analysis active.")
+    except Exception as exc:
+        app.state.impact = None
+        logger.warning("ImpactService unavailable on startup (degraded mode): %s", exc)
+
     logger.info("All services connected — API ready.")
     yield
 
@@ -82,6 +96,8 @@ async def lifespan(app: FastAPI):
     await app.state.neo4j.close()
     await app.state.es.close()
     await app.state.cache.close()
+    if app.state.impact:
+        await app.state.impact.close()
     logger.info("Agency Ontology Retrieval API shut down.")
 
 
@@ -129,6 +145,7 @@ app.include_router(search.router, prefix="/v1", tags=["search"])
 app.include_router(enrich.router, prefix="/v1", tags=["enrich"])
 app.include_router(schema_context.router, prefix="/v1", tags=["schema-context"])
 app.include_router(feedback.router, prefix="/v1", tags=["feedback"])
+app.include_router(impact.router, prefix="/v1", tags=["impact"])
 
 
 # ── Health endpoints ───────────────────────────────────────────────────────────

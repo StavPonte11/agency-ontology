@@ -24,6 +24,8 @@ class ConnectorType(str, Enum):
     CUSTOM_API = "CUSTOM_API"
     CONFLUENCE = "CONFLUENCE"
     GIT = "GIT"
+    EXCEL = "EXCEL"
+
 
 
 class SourceDocument(BaseModel):

@@ -249,8 +249,24 @@ Located at `tests/evaluation/eval_dataset.json`.
 
 ---
 
-## API Endpoints (Retrieval API)
+## Impact Analysis Extension (v2+)
 
+The Agency Ontology System includes a state-of-the-art **Impact Analysis and Consequence Mapping Engine**. This allows AI agents and operators to simulate disruptions (e.g., a data center outage) and map the cascading downstream effects across the organizational architecture using a canonical **Five-Layer Impact Stack**:
+1. **Trigger:** The physical/logical location or entity affected natively.
+2. **Direct Consequence:** Departments or business units hosted there.
+3. **Operational Entity:** Projects or systems run by those departments.
+4. **Stakeholder Consequence:** Clients or end-users served by the projects.
+5. **Systemic Implication:** SLI/SLA breaches, PR impact, etc.
+
+### Core Features:
+- **Pre-operational Halt (PLANNED status):** Entities marked as `PLANNED` or `SUSPENDED` implicitly halt the propagation of active severity, escalating delays instead of critical outages.
+- **Excel Dependency Ingestion:** Safe LLM-assisted connector (`ExcelConnector`) that performs schema detection from unstructured spreadsheets, requires operator confirmation, and routes unparseable data to a Review Queue (zero silent discards).
+- **Situation Reports (MCP Native):** Strictly formatted, LLM-generated incident action plans exposing *Critical*, *High*, and *Monitor* tiers based on dependency traversal.
+- **Next.js Portal Views:** 5 dedicated visual pages for exploring the dependency graph, reviewing pipeline coverage, assessing location SPOFs (Single Points of Failure), and running impact query scenarios.
+
+## API Endpoints (Retrieval & Impact API)
+
+### Core Ontology Retrieval
 | Endpoint | Method | Use case |
 |---|---|---|
 | `/api/v1/retrieval/lookup/{term}` | GET | Look up a specific Hebrew/English term |
@@ -258,6 +274,21 @@ Located at `tests/evaluation/eval_dataset.json`.
 | `/api/v1/retrieval/enrich` | POST | Extract concepts from a text block for agent grounding |
 | `/api/v1/retrieval/schema-context` | POST | Get DB tables/columns for TextToSQL |
 | `/api/v1/retrieval/feedback` | POST | Submit agent feedback on an ontology entry |
+
+### Impact Analysis Engine (MCP Target)
+| Endpoint | Method | Use case |
+|---|---|---|
+| `/api/v1/impact/propagate` | POST | Run a Five-Layer impact simulation / extract situation report |
+| `/api/v1/impact/reverse` | POST | Find upstream dependencies (who relies on this?) |
+| `/api/v1/impact/compare` | POST | Blast-radius comparative analysis between multiple targets |
+| `/api/v1/impact/mitigations` | POST | Retrieve explicitly mapped backup strategies and fallback routes |
+| `/api/v1/impact/historical` | POST | Fetch historical post-mortems for impacted sectors |
+| `/api/v1/impact/coverage` | GET | Check ontology graph density and Single-Point-of-Failure mapping |
+| `/api/v1/impact/excel/detect-schema` | POST | Analyze Excel header formats to propose column ingestion mapping |
+| `/api/v1/impact/excel/ingest` | POST | Commit Excel-based dependency definitions to the Neo4j graph |
+
+| Health / Metrics | Method | Use case |
+|---|---|---|
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics |
 
@@ -284,8 +315,10 @@ Located at `tests/evaluation/eval_dataset.json`.
 | 3 | LLM Extraction Pipeline | ✅ Complete |
 | 4 | FastAPI Retrieval Services | ✅ Complete |
 | 5 | MCP Tools + TypeScript Types | ✅ Complete |
-| 6 | Next.js Portal (8 pages) | ✅ Complete |
-| 7 | Observability + Tests | ✅ Complete |
+| 6 | Next.js Portal Core Pages | ✅ Complete |
+| 7 | Portal Impact Views (5 modules) | ✅ Complete |
+| 8 | Impact Analysis Component (Phase 1-8) | ✅ Complete |
+| 9 | Observability + Tests | ✅ Complete |
 
 ---
 

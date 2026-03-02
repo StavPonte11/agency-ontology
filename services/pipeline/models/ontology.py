@@ -887,3 +887,474 @@ class ChunkESDocument(BaseModel):
     document_title: str
     created_at: datetime
     embedding: Optional[list[float]] = None  # 1024-dim
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IMPACT ANALYSIS & CONSEQUENCE MAPPING DOMAIN MODELS
+# Implements the Five-Layer Impact Stack from the spec.
+# These models extend the existing ontology layer — every impact entity is also
+# a Concept node; these models describe the operational properties added on top.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Impact Enumerations ───────────────────────────────────────────────────────
+
+class OperationalStatus(str, Enum):
+    """Operational lifecycle state of a project or entity.
+    PLANNED status is the most important discriminator — it halts severity
+    propagation in the engine (spec Part 1.2, Part 10).
+    """
+    ACTIVE = "ACTIVE"
+    PLANNED = "PLANNED"       # never been operational — delays only, not harm
+    SUSPENDED = "SUSPENDED"   # was operational, now paused
+    CLOSED = "CLOSED"         # permanently decommissioned
+
+
+class ImpactCriticality(str, Enum):
+    """Criticality level for impact entities and dependency edges."""
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    NEGLIGIBLE = "NEGLIGIBLE"
+
+
+class ClientTier(str, Enum):
+    """Client/stakeholder tier for SLA prioritisation."""
+    TIER_1 = "TIER_1"   # highest priority, shortest SLA breach window
+    TIER_2 = "TIER_2"
+    TIER_3 = "TIER_3"
+
+
+class PropagationMode(str, Enum):
+    """How impact propagates across a dependency edge."""
+    DIRECT = "DIRECT"           # immediate and certain
+    CONDITIONAL = "CONDITIONAL" # depends on a condition string
+    TIME_DELAYED = "TIME_DELAYED"  # appears after N hours/days
+    PARTIAL = "PARTIAL"         # only some functions affected
+
+
+class ImpactEntityType(str, Enum):
+    """Entity types in the impact domain (maps to Concept node subtypes)."""
+    LOCATION = "LOCATION"
+    DEPARTMENT = "DEPARTMENT"
+    PROJECT = "PROJECT"
+    CLIENT = "CLIENT"
+    ASSET = "ASSET"
+    SYSTEM = "SYSTEM"
+    PROCESS = "PROCESS"
+    PERSONNEL = "PERSONNEL"
+    OBLIGATION = "OBLIGATION"
+
+
+class DependencyEdgeType(str, Enum):
+    """Typed dependency relationship types between impact entities."""
+    HOSTS = "HOSTS"           # Location -> Department | Asset | System | Personnel
+    RUNS = "RUNS"             # Department -> Project | Process
+    OPERATES = "OPERATES"     # Department -> Asset | System
+    SERVES = "SERVES"         # Project -> Client | Obligation
+    USES = "USES"             # Project | Process -> Asset | System
+    REPORTS_TO = "REPORTS_TO" # Department -> Department
+    BACKUP_FOR = "BACKUP_FOR" # Asset | Location | System -> Asset | Location | System
+    FEEDS = "FEEDS"           # System -> System
+    BLOCKS = "BLOCKS"         # Project -> Project (sequencing)
+    STAFFED_BY = "STAFFED_BY" # Department | Project -> Personnel
+
+
+class DisruptionType(str, Enum):
+    """Type of disruption to the trigger entity."""
+    PHYSICAL = "PHYSICAL"
+    POWER = "POWER"
+    ACCESS = "ACCESS"
+    COMMUNICATIONS = "COMMUNICATIONS"
+    CYBER = "CYBER"
+    UNKNOWN = "UNKNOWN"
+
+
+# ── Impact Entity Properties ──────────────────────────────────────────────────
+
+class ImpactEntityProperties(BaseModel):
+    """Operational properties added to existing Concept nodes.
+    These are SET directly on the Concept node in Neo4j (not a separate node).
+    """
+    entity_type: ImpactEntityType = Field(
+        description="Impact-domain entity type (LOCATION, PROJECT, CLIENT, etc.)"
+    )
+    operational_status: OperationalStatus = Field(
+        default=OperationalStatus.ACTIVE,
+        description="Lifecycle state. PLANNED halts severity propagation in the engine.",
+    )
+    criticality_level: ImpactCriticality = Field(
+        default=ImpactCriticality.MEDIUM,
+        description="Inherent criticality of this entity to the organisation",
+    )
+    # Client-specific
+    client_tier: Optional[ClientTier] = None
+    sla_breach_hours: Optional[int] = Field(
+        default=None,
+        description="SLA breach threshold in hours (for CLIENT and OBLIGATION entities)"
+    )
+    has_active_clients: bool = False
+
+    # Location-specific
+    backup_location_ref: Optional[str] = Field(
+        default=None, description="Name of backup Location concept"
+    )
+    can_operate_remotely: bool = False   # DEPARTMENT flag
+
+    # Asset/System-specific
+    has_backup: bool = False
+    backup_asset_ref: Optional[str] = None
+    has_failover: bool = False
+    failover_time_hours: Optional[int] = None
+    is_shared: bool = False   # system used by many entities — SPOF candidate
+
+    # Personnel
+    has_designated_backup: bool = False
+
+    # Graph metrics (pre-computed, refreshed after every dependency graph change)
+    downstream_count: int = Field(
+        default=0,
+        description="Total number of entities downstream in the dependency graph"
+    )
+    is_single_point_of_failure: bool = Field(
+        default=False,
+        description="True when this entity has no backup/failover and downstream_count > 0"
+    )
+
+
+# ── Dependency Edge Properties ────────────────────────────────────────────────
+
+class DependencyEdgeProperties(BaseModel):
+    """Properties on a typed dependency edge between two impact entities."""
+    edge_type: DependencyEdgeType
+    criticality: ImpactCriticality
+    propagation_mode: PropagationMode = PropagationMode.DIRECT
+    mitigation_available: bool = False
+    recovery_time_hours: Optional[int] = None
+    condition: Optional[str] = Field(
+        default=None,
+        description="If propagation_mode=CONDITIONAL, the condition that triggers impact"
+    )
+    notes: Optional[str] = None
+
+
+# ── Propagation Result Models ─────────────────────────────────────────────────
+
+class ImpactedEntity(BaseModel):
+    """A single entity found during propagation traversal."""
+    name: str
+    entity_type: ImpactEntityType
+    operational_status: OperationalStatus
+    criticality: ImpactCriticality
+    hop_distance: int = Field(description="Number of hops from the trigger entity")
+    propagation_path: list[str] = Field(
+        description="Ordered list of entity names from trigger to this entity"
+    )
+    # Edge metadata along the final hop
+    edge_type: Optional[DependencyEdgeType] = None
+    propagation_mode: PropagationMode = PropagationMode.DIRECT
+    mitigation_available: bool = False
+    recovery_time_hours: Optional[int] = None
+    # Computed tier (based on criticality + operational status + mitigation)
+    impact_tier: str = Field(
+        description="CRITICAL | HIGH | MONITOR — assigned by propagation engine"
+    )
+    # Client-specific enrichment
+    client_tier: Optional[ClientTier] = None
+    sla_breach_hours: Optional[int] = None
+    # Metadata
+    is_single_point_of_failure: bool = False
+    notes: Optional[str] = None
+
+
+class MitigationOption(BaseModel):
+    """A concrete mitigation option for an affected entity."""
+    entity_name: str
+    option_type: str = Field(
+        description="'backup_location' | 'redundant_asset' | 'alternative_dept' | 'historical_precedent' | 'documented_fallback'"
+    )
+    description: str
+    source: str = Field(description="Where this option came from (node name, document title, etc.)")
+    estimated_recovery_hours: Optional[int] = None
+    confidence: Confidence = 0.8
+
+
+class PropagationResult(BaseModel):
+    """Complete result of an impact propagation computation."""
+    trigger_entity: str
+    trigger_entity_type: ImpactEntityType
+    disruption_type: DisruptionType = DisruptionType.UNKNOWN
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    is_simulation: bool = False   # True for impact_scenario_model calls
+
+    # Tiered entity lists
+    critical_entities: list[ImpactedEntity] = Field(default_factory=list)
+    high_entities: list[ImpactedEntity] = Field(default_factory=list)
+    monitor_entities: list[ImpactedEntity] = Field(default_factory=list)
+
+    # Metadata
+    total_affected: int = 0
+    max_depth_reached: int = 0
+    traversal_complete: bool = True   # False if max_depth cut off the traversal
+    mitigations: list[MitigationOption] = Field(default_factory=list)
+    historical_context: list[Any] = Field(default_factory=list)  # list[HistoricalIncident]
+
+    # Quality
+    coverage_confidence: Confidence = Field(
+        default=0.8,
+        description="How complete is the dependency data for this trigger entity"
+    )
+    low_coverage_entities: list[str] = Field(
+        default_factory=list,
+        description="Entity names with incomplete dependency data (lower confidence)"
+    )
+
+
+# ── Situation Report (Part 6 contract) ───────────────────────────────────────
+
+class SituationReport(BaseModel):
+    """Structured situation report — the Part 6 output format contract.
+    The LLM is prompted to produce EXACTLY this shape.
+    A vague summary without named entities is a quality failure (spec Part 10).
+    """
+    location_name: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    is_simulation: bool = False
+
+    # Part 6 sections — each must name specific entities from the graph
+    situation: str = Field(
+        description=(
+            "2-3 sentences: what happened, what is directly affected, overall severity. "
+            "Must name specific entities — not vague summaries."
+        )
+    )
+    critical_immediate: list[str] = Field(
+        description=(
+            "Numbered list. CRITICAL entities with no available mitigation only. "
+            "Each item: entity name, why critical, specific action, time window."
+        )
+    )
+    high_time_sensitive: list[str] = Field(
+        description=(
+            "Numbered list. HIGH entities. Include available mitigation if known."
+        )
+    )
+    monitor_no_action: list[str] = Field(
+        description=(
+            "Brief list. Pre-operational entities, low-criticality impacts, well-mitigated items. "
+            "MUST explain WHY each does not need immediate action. "
+            "Example: 'Project B is pre-operational, Client G is not yet being served.'"
+        )
+    )
+    historical_context: str = Field(
+        description=(
+            "Most relevant past incident and outcome (one paragraph), "
+            "OR 'No closely matching historical incidents found in knowledge base.'"
+        )
+    )
+    confidence: str = Field(
+        description="HIGH | MEDIUM | LOW"
+    )
+    confidence_reason: str = Field(
+        description=(
+            "One sentence explaining the confidence rating. "
+            "Example: 'MEDIUM: dependency data for 3 of 8 directly hosted entities is incomplete.'"
+        )
+    )
+
+    # Entities named in the report — used for hallucination checking
+    named_entities: list[str] = Field(
+        default_factory=list,
+        description="All entity names explicitly mentioned in this report (for validation)"
+    )
+
+
+# ── Historical Incident (not a Concept — standalone node) ────────────────────
+
+class HistoricalIncident(BaseModel):
+    """A past incident record — immutable after ingestion.
+    Stored as HistoricalIncident nodes in Neo4j, NOT as Concept nodes.
+    Agents cannot create, modify, or delete these — write path is ingestion only.
+    """
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    incident_date: Optional[str] = Field(
+        default=None,
+        description="ISO date string if found in source, else None"
+    )
+    title: str = Field(description="Short incident title")
+    description: str
+    # Entity references (matched to Concept node names in the graph)
+    location_refs: list[str] = Field(
+        default_factory=list,
+        description="Names of location Concept nodes involved"
+    )
+    entity_refs: list[str] = Field(
+        default_factory=list,
+        description="Names of other Concept nodes involved"
+    )
+    # What happened
+    disruption_type: Optional[DisruptionType] = None
+    actions_taken: list[str] = Field(default_factory=list)
+    outcome: str = ""
+    recovery_time_hours: Optional[int] = None
+    lessons_recorded: list[str] = Field(default_factory=list)
+    # Provenance
+    source_document: str = Field(description="Source document title")
+    source_chunk_id: Optional[str] = None
+    ingested_at: datetime = Field(default_factory=datetime.utcnow)
+    confidence: Confidence = 0.8
+
+
+class HistoricalIncidentExtractionOutput(BaseModel):
+    """LLM extraction output for historical incident files.
+    Used by HistoricalIncidentExtractor — fed to with_structured_output.
+    """
+    incidents: list[HistoricalIncident] = Field(
+        description=(
+            "All historical incidents found in this text chunk. "
+            "Focus on: named incidents with dates, affected locations, "
+            "actions taken, outcomes, recovery times, and lessons recorded. "
+            "Empty list if no incidents are described."
+        )
+    )
+    summary: str = Field(
+        default="",
+        description="One sentence describing what this chunk is about"
+    )
+
+
+# ── Excel Connector Models ────────────────────────────────────────────────────
+
+class DetectedColumnRole(str, Enum):
+    """Role a column plays in the Excel dependency schema."""
+    LOCATION_ID = "LOCATION_ID"       # primary location identifier
+    LOCATION_DESC = "LOCATION_DESC"   # location description/notes
+    DEPENDENCY = "DEPENDENCY"          # free-text dependency string
+    META = "META"                      # region, tier, status metadata
+    UNKNOWN = "UNKNOWN"
+
+
+class DetectedColumn(BaseModel):
+    """A single column from the schema detection pass."""
+    column_name: str
+    detected_role: DetectedColumnRole
+    sample_values: list[str] = Field(default_factory=list)
+    confidence: Confidence = 0.8
+    notes: Optional[str] = None
+
+
+class DetectedSchema(BaseModel):
+    """Output of ExcelConnector.detect_schema() — shown to operator for confirmation
+    before any ingestion runs. The operator can override any column assignment.
+    This is the key UX gate that prevents bad data from silently entering the graph.
+    """
+    columns: list[DetectedColumn]
+    location_column: str = Field(description="Name of the column identified as location ID")
+    dependency_columns: list[str] = Field(description="Columns that contain dependency strings")
+    description_columns: list[str] = Field(description="Columns with free-text descriptions")
+    meta_columns: list[str] = Field(description="Columns with metadata (region, tier, status, etc.)")
+    total_rows: int
+    sample_rows: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="First 5 rows for operator preview"
+    )
+    detection_confidence: Confidence = 0.9
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Detected issues: merged cells, multi-sheet, partial rows, etc."
+    )
+
+
+class ExcelDependencyExtraction(BaseModel):
+    """LLM-extracted dependencies from a single Excel row.
+    Produced by with_structured_output on the dependency column text.
+    """
+    location_name: str = Field(description="Cleaned, canonical location name from this row")
+    entities: list[dict[str, Any]] = Field(
+        description=(
+            "List of extracted entities. Each: "
+            "{entity_name: str, entity_type: str, edge_type: str, "
+            "edge_criticality: str, notes: str}"
+        )
+    )
+    operational_status_hints: dict[str, str] = Field(
+        default_factory=dict,
+        description="entity_name -> operational status if inferable (ACTIVE/PLANNED/SUSPENDED)"
+    )
+    review_needed: bool = Field(
+        default=False,
+        description="True if row is ambiguous, partial, or confidence is low"
+    )
+    review_reason: Optional[str] = None
+    confidence: Confidence = 0.8
+
+
+class ExcelIngestionResult(BaseModel):
+    """Result of a full Excel file ingestion run."""
+    file_name: str
+    total_rows: int
+    committed_rows: int
+    review_queue_rows: int
+    new_entities: int
+    updated_entities: int
+    new_edges: int
+    entity_resolution_matched: int
+    entity_resolution_new: int
+    entity_resolution_ambiguous: int
+    errors: list[str] = Field(default_factory=list)
+    duration_seconds: float = 0.0
+    coverage_score_after: float = Field(
+        default=0.0,
+        description="Percentage of locations with fully-resolved dependency graphs after this run"
+    )
+
+
+# ── Impact Query Request/Response shapes (for API layer) ─────────────────────
+
+class ImpactPropagateRequest(BaseModel):
+    """Request body for POST /impact/propagate and POST /impact/scenario."""
+    entity_name: str = Field(description="Name of the trigger entity (typically a Location)")
+    disruption_type: DisruptionType = DisruptionType.UNKNOWN
+    max_depth: int = Field(default=5, ge=1, le=10)
+    include_mitigation: bool = True
+    include_historical: bool = True
+    hypothetical: bool = Field(
+        default=False,
+        description="If True, no state is written and output is labeled SIMULATION"
+    )
+
+
+class ImpactReverseRequest(BaseModel):
+    """Request for POST /impact/reverse — 'what depends on this?'"""
+    entity_name: str
+    entity_type: Optional[ImpactEntityType] = None
+    max_depth: int = Field(default=3, ge=1, le=10)
+
+
+class ImpactCompareRequest(BaseModel):
+    """Request for POST /impact/compare — blast radius comparison."""
+    location_names: list[str] = Field(min_length=2, max_length=10)
+    metric: str = Field(
+        default="downstream_count",
+        description="'downstream_count' | 'critical_project_count' | 'tier1_client_count'"
+    )
+
+
+class ImpactMitigationsRequest(BaseModel):
+    """Request for POST /impact/mitigations."""
+    entity_name: str
+    scenario_context: Optional[str] = Field(
+        default=None,
+        description="Free text describing the current situation for context-aware mitigations"
+    )
+
+
+class ImpactHistoricalRequest(BaseModel):
+    """Request for POST /impact/historical."""
+    entity_names: list[str] = Field(default_factory=list)
+    location_names: list[str] = Field(default_factory=list)
+    since_date: Optional[str] = Field(
+        default=None,
+        description="ISO date string — only return incidents after this date"
+    )
