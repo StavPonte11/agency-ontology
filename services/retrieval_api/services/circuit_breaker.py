@@ -72,24 +72,23 @@ class CircuitBreakerRegistry:
 
 
 class EmbeddingService:
-    """Generates text embeddings via an OpenAI-compatible endpoint."""
+    """Generates text embeddings via OpenAI API."""
 
-    def __init__(self, base_url: str, model: str = "mxbai-embed-large") -> None:
-        self._base_url = base_url
+    def __init__(self, api_key: str, model: str = "text-embedding-3-small") -> None:
+        self._api_key = api_key
         self._model = model
-        self._dims = 1024
 
     async def embed(self, text: str) -> list[float]:
         """Generate embedding for a text string. Hebrew text supported natively."""
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"{self._base_url}/v1", api_key="openai")
+        client = AsyncOpenAI(api_key=self._api_key)
         response = await client.embeddings.create(model=self._model, input=text)
         return response.data[0].embedding
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Embed multiple texts — batch for efficiency."""
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"{self._base_url}/v1", api_key="openai")
+        client = AsyncOpenAI(api_key=self._api_key)
         response = await client.embeddings.create(model=self._model, input=texts)
         return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
 

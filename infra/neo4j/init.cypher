@@ -10,6 +10,9 @@ CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (doc:Document) REQUIRE do
 CREATE CONSTRAINT dataasset_external_id_unique IF NOT EXISTS FOR (d:DataAsset) REQUIRE d.externalId IS UNIQUE;
 CREATE CONSTRAINT connector_id_unique IF NOT EXISTS FOR (c:SourceConnector) REQUIRE c.id IS UNIQUE;
 CREATE CONSTRAINT job_id_unique IF NOT EXISTS FOR (j:IngestionJob) REQUIRE j.id IS UNIQUE;
+// Hierarchical nodes
+CREATE CONSTRAINT label_unique IF NOT EXISTS FOR (l:Label) REQUIRE (l.conceptId, l.language) IS UNIQUE;
+CREATE CONSTRAINT statement_unique IF NOT EXISTS FOR (s:Statement) REQUIRE (s.conceptId, s.propertyId) IS UNIQUE;
 
 // ── Full-text indexes (lexical — supplementary to Elasticsearch) ──────────────
 CREATE FULLTEXT INDEX concept_fulltext IF NOT EXISTS FOR (c:Concept) ON EACH [c.name, c.description, c.nameHe, c.descriptionHe];
@@ -22,12 +25,18 @@ CREATE INDEX concept_domain IF NOT EXISTS FOR (c:Concept) ON (c.domain);
 CREATE INDEX concept_sensitivity IF NOT EXISTS FOR (c:Concept) ON (c.sensitivity);
 CREATE INDEX concept_updated IF NOT EXISTS FOR (c:Concept) ON (c.updatedAt);
 CREATE INDEX concept_usage IF NOT EXISTS FOR (c:Concept) ON (c.usageCount);
+CREATE INDEX concept_is_class IF NOT EXISTS FOR (c:Concept) ON (c.isClass);
 CREATE INDEX term_normalized IF NOT EXISTS FOR (t:Term) ON (t.normalizedForm);
 CREATE INDEX term_language IF NOT EXISTS FOR (t:Term) ON (t.language);
 CREATE INDEX dataasset_qualified IF NOT EXISTS FOR (d:DataAsset) ON (d.qualifiedName);
 CREATE INDEX dataasset_type IF NOT EXISTS FOR (d:DataAsset) ON (d.assetType);
 CREATE INDEX document_hash IF NOT EXISTS FOR (doc:Document) ON (doc.hash);
 CREATE INDEX document_connector IF NOT EXISTS FOR (doc:Document) ON (doc.connectorId);
+// Hierarchical node indexes
+CREATE INDEX label_language IF NOT EXISTS FOR (l:Label) ON (l.language);
+CREATE INDEX label_value IF NOT EXISTS FOR (l:Label) ON (l.label);
+CREATE FULLTEXT INDEX label_fulltext IF NOT EXISTS FOR (l:Label) ON EACH [l.label, l.description];
+CREATE INDEX statement_property IF NOT EXISTS FOR (s:Statement) ON (s.propertyId);
 
 // ── NOTE: No vector index in Neo4j ────────────────────────────────────────────
 // All semantic search is handled by Elasticsearch.

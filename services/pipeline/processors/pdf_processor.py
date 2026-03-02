@@ -73,17 +73,24 @@ class PDFProcessor:
         Extract text from PDF bytes and return chunks.
         Falls back to Tesseract OCR if text extraction yields insufficient text.
         """
+        logger.info(f"Processing PDF '{document_title}' (id={document_id})")
         try:
             chunks = self._extract_with_pdfplumber(pdf_bytes, document_id, document_title)
-            # If extraction was too sparse, fall back to OCR
             total_text = sum(c.char_count for c in chunks)
-            if total_text < self._min_text_length and chunks:
+            
+            if total_text < self._min_text_length:
                 logger.info(
-                    f"Sparse text ({total_text} chars) for {document_title} — trying OCR"
+                    f"Sparse text ({total_text} chars) extracted via pdfplumber for '{document_title}' — attempting OCR fallback"
                 )
                 ocr_chunks = self._extract_with_tesseract(pdf_bytes, document_id, document_title)
-                if sum(c.char_count for c in ocr_chunks) > total_text:
+                ocr_text = sum(c.char_count for c in ocr_chunks)
+                if ocr_text > total_text:
+                    logger.info(f"OCR fallback successful: {ocr_text} chars extracted from '{document_title}'")
                     return ocr_chunks
+                else:
+                    logger.warning(f"OCR fallback yielded even less text ({ocr_text} chars) for '{document_title}'")
+            
+            logger.info(f"PDF processing complete: {len(chunks)} chunks, {total_text} total chars for '{document_title}'")
             return chunks
 
         except Exception as exc:
@@ -106,11 +113,15 @@ class PDFProcessor:
         has_tables = False
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            num_pages = len(pdf.pages)
+            logger.info(f"Extracting text from {num_pages} pages using pdfplumber")
+            
             for page_num, page in enumerate(pdf.pages, start=1):
                 # Extract tables separately and append as structured text
                 tables = page.extract_tables()
                 if tables:
                     has_tables = True
+                    logger.debug(f"Detected {len(tables)} table(s) on page {page_num}")
                     for table in tables:
                         table_text = self._table_to_text(table)
                         current_text.append(table_text)
@@ -136,11 +147,13 @@ class PDFProcessor:
                                 has_tables=has_tables,
                             )
                             if chunk:
+                                logger.debug(f"Chunk created (section-based): index {len(chunks)}, size {len(chunk.content)}")
                                 chunks.append(chunk)
                             current_text = []
                             current_pages = []
                             has_tables = False
                         current_section = stripped
+                        logger.debug(f"New section detected: {current_section!r} (page {page_num})")
                     else:
                         current_text.append(stripped)
 
@@ -159,6 +172,7 @@ class PDFProcessor:
                         has_tables=has_tables,
                     )
                     if chunk:
+                        logger.debug(f"Chunk created (size-based): index {len(chunks)}, size {len(chunk.content)}")
                         chunks.append(chunk)
                     # Keep overlap from the end
                     overlap_text = combined[-self._chunk_overlap:]

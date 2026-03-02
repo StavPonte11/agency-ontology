@@ -1,20 +1,36 @@
-confluent-kafka==2.3.0
-pydantic==2.7.0
-neo4j==5.18.0
-elasticsearch==8.13.0
-fastapi==0.110.0
-uvicorn==0.29.0
-langchain==0.1.13
-langchain-openai==0.1.0
-instructor==1.1.0
-pdfplumber==0.11.0
+# --- Infrastructure & Messaging ---
+confluent-kafka==2.13.0
+redis==5.3.0
+elasticsearch==8.17.0
+neo4j==5.27.0
+
+# --- Core Framework & Validation ---
+pydantic==2.10.6
+pydantic-settings==2.10.1
+fastapi==0.115.8
+uvicorn==0.34.0
+httpx==0.28.1
+
+# --- LangChain 1.x Ecosystem ---
+# LangChain 1.2.x is the current 2026 standard
+langchain==1.2.10
+langchain-openai==1.1.10
+langchain-core==1.2.16
+langchain-community==0.4.1
+instructor==1.14.4
+
+# --- Observability (OpenTelemetry 2026) ---
+opentelemetry-api==1.30.0
+opentelemetry-sdk==1.30.0
+opentelemetry-instrumentation-fastapi==0.51b0
+langfuse==2.50.0
+
+# --- Data & PDF Processing ---
+pdfplumber==0.11.5
 pdf2image==1.17.0
 pytesseract==0.3.10
-httpx==0.27.0
-redis==5.0.3
-opentelemetry-api==1.23.0
-opentelemetry-sdk==1.23.0
-opentelemetry-instrumentation-fastapi==0.44b0
-langfuse==2.21.0
-pytest==8.1.1
-pytest-asyncio==0.23.6
+
+# --- Testing ---
+pytest==8.3.4
+pytest-asyncio==0.25.3
+python-dotenv==1.0.1

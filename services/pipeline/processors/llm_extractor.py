@@ -8,6 +8,7 @@ Primary language: Hebrew (עברית)
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 
@@ -15,9 +16,65 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import ValidationError
 
-from ..models.ontology import LLMExtractionOutput, TermType, Language
+from ..models.ontology import (
+    LLMExtractionOutput,
+    HierarchicalExtractionOutput,
+    DocumentType,
+    TermType,
+    Language,
+)
 
 logger = logging.getLogger(__name__)
+
+# ── Hierarchical extraction model selection ────────────────────────────────────
+
+# Document types that always use the hierarchical extraction model
+HIERARCHICAL_DOCUMENT_TYPES = {DocumentType.PDF_DICTIONARY, DocumentType.CATALOG}
+
+# Keyword signals in chunk content indicating classifiable, typed entities
+HIERARCHICAL_CONTENT_SIGNALS: list[str] = [
+    # English signals
+    "instance of", "subclass of", "type of", "is a", "category",
+    "class of", "kind of", "brigade", "division", "department",
+    "system type", "policy type", "role type", "inception", "founded",
+    # Hebrew signals
+    "חטיבה", "סוג", "מחלקה", "פיקוד", "יחידה", "נוסד",
+]
+
+
+def select_extraction_model(
+    chunk_content: str,
+    document_type: str | DocumentType | None,
+) -> type:
+    """
+    Choose flat (LLMExtractionOutput) or hierarchical (HierarchicalExtractionOutput)
+    extraction model based on document type and content signals.
+
+    Strategy:
+    - Always use HierarchicalExtractionOutput for PDF_DICTIONARY and CATALOG documents.
+    - Use it for other documents when chunk content contains >= 2 hierarchy signals.
+    - Hierarchical model is a strict superset — using it on flat content is safe;
+      hierarchy/statements fields will simply be empty lists.
+    """
+    # Normalise document_type
+    if isinstance(document_type, str):
+        try:
+            document_type = DocumentType(document_type)
+        except ValueError:
+            document_type = None
+
+    if document_type in HIERARCHICAL_DOCUMENT_TYPES:
+        logger.debug(f"Hierarchical model selected: document_type={document_type}")
+        return HierarchicalExtractionOutput
+
+    content_lower = chunk_content.lower()
+    signal_count = sum(1 for s in HIERARCHICAL_CONTENT_SIGNALS if s in content_lower)
+    if signal_count >= 2:
+        logger.debug(f"Hierarchical model selected: {signal_count} content signals detected")
+        return HierarchicalExtractionOutput
+
+    return LLMExtractionOutput
+
 
 # ── System prompt — Hebrew military domain ─────────────────────────────────────
 # Written with explicit Hebrew domain awareness: nikud, acronyms (ר"מ, מפ"ג),
@@ -52,6 +109,38 @@ EXTRACTION RULES — follow strictly:
 12. source_quote is REQUIRED for every concept and relationship — copy exact text.
 13. For Hebrew concepts: set language="he". For English: "en". Mixed: "mixed".
 """
+
+HIERARCHICAL_SYSTEM_PROMPT_ADDITION = """\
+
+HIERARCHICAL EXTRACTION RULES — additional rules when using HierarchicalExtractionOutput:
+14. HIERARCHY — extract the taxonomic position of EVERY concept:
+    - INSTANCE_OF: use when this concept is a SPECIFIC named entity/instance of a class.
+      Example: 'Judea Territorial Brigade' INSTANCE_OF 'Territorial Brigade'
+      Example: 'System X v2.1' INSTANCE_OF 'System X'
+    - SUBCLASS_OF: use when this concept is a CATEGORY specialising a broader category.
+      Example: 'Territorial Brigade' SUBCLASS_OF 'Brigade'
+      Example: 'Brigade' SUBCLASS_OF 'Military Unit'
+    - PART_OF_HIERARCHY: use for structural/organisational containment.
+      Example: 'Alpha Squadron' PART_OF_HIERARCHY 'Delta Battalion'
+    - NEVER use INSTANCE_OF and SUBCLASS_OF for the same concept/target pair.
+    - NEVER point INSTANCE_OF at a specific named entity (that would be PART_OF_HIERARCHY).
+    - If you cannot place a concept in the hierarchy: leave hierarchy=[] (do NOT guess).
+15. is_class=True ONLY for generic types/categories (Brigade, System Type, Role, Policy Type).
+    Specific named entities are NEVER classes.
+16. MULTILINGUAL LABELS — for EVERY concept:
+    - Include a label for each language found in the source
+    - If source has both Hebrew and English: add both language entries
+    - Put ALL aliases (official abbreviations, nicknames, codenames) in the aliases list
+      for their respective language entry
+17. STATEMENTS — extract explicit factual properties:
+    - inception / founded → value_type='date'
+    - parent_unit / parent_org → value_type='concept_ref', concept_ref_id = parent concept name
+    - location, commander, capacity, status, classification → value_type='string'
+    - Leave statements=[] if no properties are explicitly stated
+18. CIRCULAR HIERARCHY CHECK: do NOT create a hierarchy where a concept is its own
+    ancestor. If you detect a potential cycle, omit the problematic hierarchy entry.
+"""
+
 
 EXTRACTION_HUMAN_PROMPT = """\
 חלץ את כל מושגי הארגון, הקשרים ומיפויי הנתונים מהטקסט הבא.
@@ -88,8 +177,13 @@ class LLMExtractor:
     """
     Extracts structured ontology entities from text chunks.
 
-    Primary: LangChain ChatOpenAI with with_structured_output(method="json_schema")
-    Fallback: instructor library with OpenAI-compatible client
+    Primary: LangChain ChatOpenAI with with_structured_output
+    Supports both:
+      - OpenAI (api_key required, base_url=None)
+      - Ollama (base_url="http://localhost:11434/v1", api_key="ollama")
+
+    Ollama uses json_mode (not json_schema) since open-weight models
+    don't support the full OpenAI function-calling schema protocol.
 
     Hebrew military domain:
     - Expects Hebrew primary language in chunks
@@ -99,36 +193,83 @@ class LLMExtractor:
 
     def __init__(
         self,
-        openai_base_url: str,
+        api_key: str,
         model: str,
         langfuse_client: Any,           # langfuse.Langfuse
         max_retries: int = 1,
         temperature: float = 0.0,
+        base_url: Optional[str] = None,  # Set to Ollama URL to use local model
     ) -> None:
         self._model_name = model
         self._langfuse = langfuse_client
         self._max_retries = max_retries
+        self._api_key = api_key
 
-        # Primary: LangChain + ChatOpenAI with JSON schema structured output
-        self._llm = ChatOpenAI(
-            base_url=openai_base_url,
+        # Detect backend: Ollama (base_url set) vs OpenAI
+        using_ollama = bool(base_url)
+        if using_ollama:
+            logger.info(f"LLMExtractor: using Ollama at {base_url} with model={model}")
+        else:
+            logger.info(f"LLMExtractor: using OpenAI with model={model}")
+
+        # Build the ChatOpenAI client — works for both OpenAI and Ollama
+        # (Ollama serves an OpenAI-compatible REST API at /v1)
+        llm_kwargs: dict = dict(
             model=model,
             temperature=temperature,
-            model_kwargs={"num_ctx": 8192},
         )
+        if base_url:
+            # Ollama: dummy key required by LangChain but ignored server-side
+            llm_kwargs["base_url"] = base_url
+            llm_kwargs["api_key"] = api_key or "ollama"
+        else:
+            llm_kwargs["api_key"] = api_key
+
+        self._llm = ChatOpenAI(**llm_kwargs)
+
+        # Ollama open-weight models don't support json_schema tool-calling,
+        # use json_mode (prompt-based) instead.
+        output_method = "json_mode" if using_ollama else "json_schema"
+        logger.debug(f"Structured output method: {output_method}")
+
+        # Flat chain — used for general documents
         self._structured_llm = self._llm.with_structured_output(
             LLMExtractionOutput,
-            method="json_schema",   # OpenAI JSON schema constrained generation
-            include_raw=True,       # Capture raw response for LangFuse token counting
+            method=output_method,
         )
+        # Hierarchical chain — used for PDF_DICTIONARY, CATALOG, or signal-heavy content
+        self._hierarchical_llm = self._llm.with_structured_output(
+            HierarchicalExtractionOutput,
+            method=output_method,
+        )
+        
+        system_prompt = EXTRACTION_SYSTEM_PROMPT
+        hier_system_prompt = EXTRACTION_SYSTEM_PROMPT + HIERARCHICAL_SYSTEM_PROMPT_ADDITION
+        
+        if using_ollama:
+            # In json_mode, the LLM needs to see the schema to follow it
+            schema_flat = json.dumps(LLMExtractionOutput.model_json_schema(), separators=(',', ':'))
+            schema_hier = json.dumps(HierarchicalExtractionOutput.model_json_schema(), separators=(',', ':'))
+            
+            # Escape curly braces so LangChain's PromptTemplate doesn't treat them as variables
+            schema_flat = schema_flat.replace("{", "{{").replace("}", "}}")
+            schema_hier = schema_hier.replace("{", "{{").replace("}", "}}")
+            
+            instruction = "\n\nYou MUST return a JSON object that strictly matches this JSON Schema:\n```json\n{schema}\n```"
+            system_prompt += instruction.format(schema=schema_flat)
+            hier_system_prompt += instruction.format(schema=schema_hier)
+
         self._prompt = ChatPromptTemplate.from_messages([
-            ("system", EXTRACTION_SYSTEM_PROMPT),
+            ("system", system_prompt),
+            ("human", EXTRACTION_HUMAN_PROMPT),
+        ])
+        self._hierarchical_prompt = ChatPromptTemplate.from_messages([
+            ("system", hier_system_prompt),
             ("human", EXTRACTION_HUMAN_PROMPT),
         ])
         self._chain = self._prompt | self._structured_llm
+        self._hierarchical_chain = self._hierarchical_prompt | self._hierarchical_llm
 
-        # Fallback: instructor
-        self._openai_base_url = openai_base_url
 
     async def extract(
         self,
@@ -139,12 +280,25 @@ class LLMExtractor:
         job_id: str,
         trace_id: str,
         primary_language: str = "he",
-    ) -> LLMExtractionOutput:
+        document_type: str | DocumentType | None = None,
+    ) -> LLMExtractionOutput | HierarchicalExtractionOutput:
         """
         Extract ontology entities from a text chunk.
-        Returns validated LLMExtractionOutput.
-        On repeated failure: returns empty extraction and signals review queue.
+
+        Automatically selects between flat LLMExtractionOutput and
+        HierarchicalExtractionOutput based on document_type and content signals.
+
+        Returns validated extraction output. On repeated failure returns an empty
+        extraction and signals review queue.
         """
+        chosen_model = select_extraction_model(chunk_content, document_type)
+        use_hierarchical = chosen_model is HierarchicalExtractionOutput
+        chain = self._hierarchical_chain if use_hierarchical else self._chain
+
+        logger.info(
+            f"Starting extraction for chunk {trace_id} (doc={document_title}, "
+            f"model={'hierarchical' if use_hierarchical else 'flat'})"
+        )
         # Build LangFuse callback handler if available
         callbacks = []
         try:
@@ -160,7 +314,7 @@ class LLMExtractor:
 
         for attempt in range(self._max_retries + 1):
             try:
-                result = await self._chain.ainvoke(
+                result = await chain.ainvoke(
                     {
                         "document_title": document_title,
                         "section_title": section_title or "לא ידוע / Unknown",
@@ -171,39 +325,23 @@ class LLMExtractor:
                     config={"callbacks": callbacks} if callbacks else {},
                 )
 
-                # include_raw=True → {"raw": AIMessage, "parsed": Model, "parsing_error": ...}
-                if isinstance(result, dict):
-                    parsing_error = result.get("parsing_error")
-                    parsed = result.get("parsed")
-
-                    if parsing_error:
-                        raise ValueError(f"Parsing error: {parsing_error}")
-                    if parsed is None:
-                        raise ValueError("Structured output returned None")
-
-                    # Log token usage to LangFuse
-                    raw_msg = result.get("raw")
-                    if raw_msg and hasattr(raw_msg, "usage_metadata") and self._langfuse:
-                        self._langfuse.score(
-                            trace_id=trace_id,
-                            name="extraction_tokens",
-                            value=raw_msg.usage_metadata.get("total_tokens", 0),
-                        )
-
-                    return parsed
-
-                elif isinstance(result, LLMExtractionOutput):
+                # Chain returns the parsed model directly (no include_raw)
+                if isinstance(result, (LLMExtractionOutput, HierarchicalExtractionOutput)):
+                    logger.info(
+                        f"Extracted {len(result.concepts)} concepts, "
+                        f"{len(result.relationships)} relationships for trace={trace_id}"
+                    )
                     return result
 
                 else:
-                    raise ValueError(f"Unexpected result type: {type(result)}")
+                    raise ValueError(f"Unexpected result type from chain: {type(result)}")
 
             except (ValidationError, ValueError) as exc:
                 last_exc = exc
                 if attempt < self._max_retries:
                     logger.warning(
-                        f"Extraction validation failed (attempt {attempt + 1}/{self._max_retries + 1}), retrying",
-                        extra={"job_id": job_id, "error": str(exc)[:200]},
+                        f"Extraction validation failed for {trace_id} (attempt {attempt + 1}/{self._max_retries + 1}): {exc}",
+                        extra={"job_id": job_id},
                     )
                     # Append correction hint to next attempt
                     chunk_content = (
@@ -217,7 +355,7 @@ class LLMExtractor:
                     )
 
         # Try instructor fallback before giving up
-        logger.info(f"Attempting instructor fallback for trace={trace_id}")
+        logger.info(f"Primary extractor failed for {trace_id}. Attempting instructor fallback.")
         return await self._extract_with_instructor(
             chunk_content, document_title, section_title, page_range, trace_id
         )
@@ -236,7 +374,7 @@ class LLMExtractor:
             from openai import OpenAI as _OpenAI
 
             client = instructor.from_openai(
-                _OpenAI(base_url=f"{self._openai_base_url}/v1", api_key="openai"),
+                _OpenAI(api_key=self._api_key),
                 mode=instructor.Mode.JSON,
             )
             result: LLMExtractionOutput = client.chat.completions.create(

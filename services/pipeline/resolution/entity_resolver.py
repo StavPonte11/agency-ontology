@@ -65,6 +65,7 @@ class EntityResolver:
 
     def register(self, concept_name: str, concept_id: str) -> None:
         """Register a known concept name → ID mapping."""
+        logger.info(f"Registering concept: '{concept_name}' (id={concept_id})")
         self._known_names[normalize_term(concept_name)] = concept_id
 
     def resolve(self, candidate_name: str) -> Optional[str]:
@@ -82,8 +83,8 @@ class EntityResolver:
         for known_norm, concept_id in self._known_names.items():
             score = similarity_score(normalized, known_norm)
             if score >= self.FUZZY_THRESHOLD:
-                logger.debug(
-                    f"Fuzzy match: '{candidate_name}' → concept {concept_id} (score={score:.2f})"
+                logger.info(
+                    f"Resolved: '{candidate_name}' → existing concept {concept_id} (fuzzy score={score:.2f})"
                 )
                 return concept_id
 

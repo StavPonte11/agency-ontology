@@ -38,6 +38,7 @@ class TermType(str, Enum):
 
 
 class RelationType(str, Enum):
+    # General semantic relationships
     IS_A = "IS_A"
     PART_OF = "PART_OF"
     DEPENDS_ON = "DEPENDS_ON"
@@ -49,6 +50,10 @@ class RelationType(str, Enum):
     PRODUCES = "PRODUCES"
     CONSUMES = "CONSUMES"
     RELATED_TO = "RELATED_TO"
+    # Strict hierarchical types — Wikidata-style
+    INSTANCE_OF = "INSTANCE_OF"       # specific entity → its class
+    SUBCLASS_OF = "SUBCLASS_OF"       # class → its superclass
+    PART_OF_HIERARCHY = "PART_OF_HIERARCHY"  # structural containment in org hierarchy
 
 
 class ConceptStatus(str, Enum):
@@ -254,6 +259,36 @@ class ExtractedConcept(BaseModel):
         description="The exact sentence(s) from the source text that define this concept. Required."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_missing_name(
+        cls, values: Any,
+    ) -> Any:
+        """
+        Robustness shim for local LLMs that produce `name_he` or `canonical_name`
+        instead of the required `name` field.
+        """
+        if isinstance(values, dict):
+            if not values.get("name"):
+                # Prefer name_he, then canonical_name, then surface_form of first term
+                fallback = (
+                    values.get("name_he")
+                    or values.get("canonical_name")
+                    or values.get("canonical")
+                )
+                if not fallback and values.get("terms"):
+                    first_term = values["terms"][0]
+                    if isinstance(first_term, dict):
+                        fallback = first_term.get("surface_form")
+                    elif hasattr(first_term, "surface_form"):
+                        fallback = first_term.surface_form
+                if fallback:
+                    values["name"] = fallback
+            if not values.get("description"):
+                # Fall back to description_he or empty string
+                values["description"] = values.get("description_he") or ""
+        return values
+
     @field_validator("terms")
     @classmethod
     def terms_must_include_name(
@@ -302,6 +337,7 @@ class LLMExtractionOutput(BaseModel):
         )
     )
     chunk_summary: str = Field(
+        default="",
         description=(
             "One sentence describing what this chunk is about "
             "(used for pipeline logging, not stored in graph)"
@@ -312,6 +348,190 @@ class LLMExtractionOutput(BaseModel):
         description=(
             "Any ambiguities, conflicts, or low-confidence items worth flagging for human review"
         ),
+    )
+
+
+# ── Hierarchical ontology models (Wikidata-style inheritance) ────────────────────
+
+class StatementValue(BaseModel):
+    """
+    A single property-value statement on a concept, modelled after Wikidata statements.
+    Holds exactly one value depending on value_type.
+    """
+    property_id: str = Field(
+        description="Property identifier, e.g. 'instance_of', 'inception', 'parent_unit'"
+    )
+    property_label: str = Field(
+        description="Human-readable property label in English"
+    )
+    value_type: str = Field(
+        description="'concept_ref' | 'string' | 'date' | 'number' | 'multilingual'"
+    )
+    # Exactly one of the following is populated:
+    concept_ref_id: Optional[str] = Field(
+        default=None,
+        description="If value_type='concept_ref': canonical name of the referenced concept"
+    )
+    string_value: Optional[str] = Field(
+        default=None,
+        description="If value_type='string' | 'date' | 'number': raw value as string"
+    )
+    multilingual_values: Optional[dict[str, str]] = Field(
+        default=None,
+        description="If value_type='multilingual': lang_code → value, e.g. {'en': 'Brigade', 'he': 'חטיבה'}"
+    )
+    confidence: Confidence = Field(default=0.8)
+    source_quote: Optional[str] = Field(
+        default=None, description="Source sentence supporting this statement"
+    )
+
+
+class MultilingualLabel(BaseModel):
+    """
+    A label (name) for a concept in a specific language.
+    Mirrors Wikidata's label/description/alias structure per language.
+    """
+    language: str = Field(description="BCP-47 language code: 'en', 'he', 'ar'")
+    label: str = Field(description="Primary label in this language")
+    description: Optional[str] = Field(
+        default=None,
+        description="Short disambiguating description in this language (1 sentence)"
+    )
+    aliases: list[str] = Field(
+        default_factory=list,
+        description="Additional names/aliases in this language"
+    )
+
+
+class HierarchyRelation(BaseModel):
+    """Explicit hierarchical relationship — strictly typed, separate from RELATED_TO."""
+    relation: str = Field(
+        description="'INSTANCE_OF' | 'SUBCLASS_OF' | 'PART_OF_HIERARCHY'"
+    )
+    target_concept_name: str = Field(
+        description="Canonical name of the parent class or type concept"
+    )
+    confidence: Confidence
+    source_quote: Optional[str] = None
+
+
+class HierarchicalConcept(BaseModel):
+    """
+    Extends ExtractedConcept with Wikidata-style hierarchical statements
+    and per-language multilingual labels.
+
+    IMPORTANT extraction rules for the LLM:
+    - INSTANCE_OF: use when this concept is a SPECIFIC named entity/instance of a class.
+      Example: 'Judea Territorial Brigade' INSTANCE_OF 'Territorial Brigade'
+    - SUBCLASS_OF: use when this concept is a CATEGORY that specialises a broader category.
+      Example: 'Territorial Brigade' SUBCLASS_OF 'Brigade'
+    - PART_OF_HIERARCHY: use for structural containment in org/system hierarchy.
+      Example: 'Alpha Squadron' PART_OF_HIERARCHY 'Delta Battalion'
+    - is_class=True when this concept is a type/category others are instances of.
+    """
+
+    # Core fields (same meaning as ExtractedConcept)
+    name: str = Field(description="Canonical English name")
+    description: str = Field(description="1-3 sentence definition from source text")
+    concept_type: ConceptType
+    domain: list[str]
+    confidence: Confidence
+    source_quote: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_missing_name(
+        cls, values: Any,
+    ) -> Any:
+        """Same robustness shim as ExtractedConcept — coerce name_he → name."""
+        if isinstance(values, dict):
+            if not values.get("name"):
+                fallback = (
+                    values.get("name_he")
+                    or values.get("canonical_name")
+                    or values.get("canonical")
+                )
+                if not fallback and values.get("multilingual_labels"):
+                    first = values["multilingual_labels"][0]
+                    if isinstance(first, dict):
+                        fallback = first.get("label")
+                if fallback:
+                    values["name"] = fallback
+            if not values.get("description"):
+                values["description"] = values.get("description_he") or ""
+        return values
+
+    # Hierarchical extensions
+    multilingual_labels: list[MultilingualLabel] = Field(
+        default_factory=list,
+        description=(
+            "All language variants of this concept's name, description, and aliases. "
+            "Include every language present in the source. "
+            "Example: [{language: 'he', label: 'חטיבת יהודה', aliases: ['חטמ\"ר יהודה', 'חטיבת חברון']}]"
+        )
+    )
+    hierarchy: list[HierarchyRelation] = Field(
+        default_factory=list,
+        description=(
+            "Hierarchical position of this concept. Use INSTANCE_OF for specific named entities, "
+            "SUBCLASS_OF for categories. PART_OF_HIERARCHY for structural containment."
+        )
+    )
+    statements: list[StatementValue] = Field(
+        default_factory=list,
+        description=(
+            "Structured property-value facts: inception, dissolution, parent_unit, "
+            "location, commander, capacity, status, classification, version, owner. "
+            "Example: {property_id: 'inception', value_type: 'date', string_value: '1988'}"
+        )
+    )
+    is_class: bool = Field(
+        default=False,
+        description=(
+            "True if this concept is a CLASS or TYPE (a category that other things are instances of). "
+            "Example: 'Brigade' is a class. 'Judea Territorial Brigade' is NOT a class."
+        )
+    )
+    is_deprecated: bool = Field(
+        default=False,
+        description="True if the source states this concept is obsolete or decommissioned"
+    )
+    superseded_by: Optional[str] = Field(
+        default=None,
+        description="If is_deprecated=True: canonical name of the replacement concept, if stated"
+    )
+
+    @field_validator("domain")
+    @classmethod
+    def domain_must_not_be_empty(cls, v: list[str]) -> list[str]:
+        return v if v else ["General"]
+
+
+class HierarchicalExtractionOutput(BaseModel):
+    """
+    Superset of LLMExtractionOutput — adds Wikidata-style hierarchy to extracted concepts.
+    Used when document_type=PDF_DICTIONARY/CATALOG, or when chunk content contains
+    at least 2 hierarchy-signal keywords.
+
+    Fallback: if hierarchy/statements fields are empty lists, this is functionally
+    identical to LLMExtractionOutput — using it on flat content is always safe.
+    """
+    concepts: list[HierarchicalConcept] = Field(
+        description="All organizational concepts found in this text chunk. Empty list if none."
+    )
+    relationships: list[ExtractedRelationship] = Field(
+        description="Non-hierarchical relationships (same as LLMExtractionOutput)."
+    )
+    data_mappings: list[ExtractedDataMapping] = Field(
+        description="Data asset mappings (same as LLMExtractionOutput)."
+    )
+    chunk_summary: str = Field(
+        default="",
+        description="One sentence describing what this chunk is about."
+    )
+    extraction_notes: Optional[str] = Field(
+        default=None,
+        description="Ambiguities, conflicts, or low-confidence items to flag for review."
     )
 
 
@@ -462,6 +682,13 @@ class ProvenanceInfo(BaseModel):
     last_updated: datetime
 
 
+class HierarchyPathStep(BaseModel):
+    """One hop in an ancestor chain — used in LookupResult.ancestor_path."""
+    concept_id: str
+    concept_name: str
+    relation: str   # INSTANCE_OF | SUBCLASS_OF | PART_OF_HIERARCHY
+
+
 class LookupResult(BaseModel):
     """
     Successful concept lookup result.
@@ -481,6 +708,38 @@ class LookupResult(BaseModel):
     # Degraded mode: returned when Neo4j is unavailable but ES cache is available
     degraded_mode: bool = False
     degraded_reason: Optional[str] = None
+
+    # ── Hierarchical fields (Wikidata-style) ──────────────────────────────
+    is_class: bool = False
+    is_deprecated: bool = False
+    superseded_by: Optional[str] = None
+    ancestor_path: list[HierarchyPathStep] = Field(
+        default_factory=list,
+        description="Full chain from this concept up to root class, nearest-first."
+    )
+    subclasses: list[ConceptRef] = Field(
+        default_factory=list,
+        description="Direct subclasses of this concept (populated when is_class=True)"
+    )
+    instances: list[ConceptRef] = Field(
+        default_factory=list,
+        description="Direct instances of this concept (populated when is_class=True)"
+    )
+    multilingual_labels: list["MultilingualLabel"] = Field(
+        default_factory=list,
+        description="All language variants: labels, descriptions, aliases"
+    )
+    statements: list["StatementValue"] = Field(
+        default_factory=list,
+        description="Structured property-value facts: inception, parent_unit, etc."
+    )
+    inherited_context: Optional[str] = Field(
+        default=None,
+        description=(
+            "Auto-assembled context block from ancestor concepts (bounded ~500 tokens). "
+            "Agents use this as additional context inherited from class membership."
+        )
+    )
 
     # TODO(permissions): Before returning, filter `data_assets` and `related`
     # based on the requesting agent's permission context. Remove CONFIDENTIAL/SECRET
@@ -597,6 +856,22 @@ class ConceptESDocument(BaseModel):
     last_used_at: Optional[datetime] = None
     verified_by: Optional[str] = None
     embedding: Optional[list[float]] = None  # 1024-dim, set by embedding stage
+    # ── Hierarchical fields ──────────────────────────────────────────────
+    is_class: bool = False
+    is_deprecated: bool = False
+    ancestor_ids: list[str] = Field(default_factory=list)    # pre-computed for O(1) class-scoped search
+    ancestor_names: list[str] = Field(default_factory=list)
+    instance_of: Optional[str] = None      # direct parent class name
+    subclass_of: Optional[str] = None      # direct superclass name (if itself a class)
+    hierarchy_depth: int = 0               # 0 = root class, increases downward
+    labels: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Nested multilingual label objects: {language, label, description, aliases}"
+    )
+    statements: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Nested statement objects: {property_id, property_label, value_type, value}"
+    )
 
 
 class ChunkESDocument(BaseModel):

@@ -7,33 +7,30 @@ Usage:
     # From project root:
     uvicorn services.retrieval_api.main:app --reload --port 8000
 """
-from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from config import settings
 # ── Router imports (absolute, works with uvicorn module path) ──────────────────
-from services.retrieval_api.routers import lookup, search, enrich, schema_context, feedback
-from services.retrieval_api.services.neo4j_service import Neo4jService
-from services.retrieval_api.services.elasticsearch_service import ElasticsearchService
+from services.retrieval_api.routers import (
+    lookup,
+    search,
+    enrich,
+    schema_context,
+    feedback,
+)
 from services.retrieval_api.services.cache_service import CacheService
-from services.retrieval_api.services.embedding_service import EmbeddingService
 from services.retrieval_api.services.circuit_breaker import CircuitBreakerRegistry
-
-import logging
-import os
-from contextlib import asynccontextmanager
-from typing import Any
-
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from services.retrieval_api.services.circuit_breaker import EmbeddingService
+from services.retrieval_api.services.elasticsearch_service import ElasticsearchService
+from services.retrieval_api.services.neo4j_service import Neo4jService
 
 logger = logging.getLogger(__name__)
 
@@ -44,30 +41,37 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Agency Ontology Retrieval API...")
 
     app.state.neo4j = Neo4jService(
-        uri=os.environ["NEO4J_URI"],
-        user=os.environ["NEO4J_USER"],
-        password=os.environ["NEO4J_PASSWORD"],
+        uri=settings.neo4j_uri,
+        user=settings.neo4j_user,
+        password=settings.neo4j_password,
     )
-    await app.state.neo4j.connect()
+    try:
+        await app.state.neo4j.connect()
+    except Exception as exc:
+        logger.warning("Neo4j unavailable on startup (degraded mode): %s", exc)
 
-    app.state.es = ElasticsearchService(
-        url=os.environ["ELASTICSEARCH_URL"]
-    )
-    await app.state.es.connect()
+    app.state.es = ElasticsearchService(url=settings.elasticsearch_url)
+    try:
+        await app.state.es.connect()
+    except Exception as exc:
+        logger.warning("Elasticsearch unavailable on startup (degraded mode): %s", exc)
 
-    app.state.cache = CacheService(redis_url=os.environ["REDIS_URL"])
-    await app.state.cache.connect()
+    app.state.cache = CacheService(redis_url=settings.redis_url)
+    try:
+        await app.state.cache.connect()
+    except Exception as exc:
+        logger.warning("Redis unavailable on startup (degraded mode): %s", exc)
 
     app.state.embedding = EmbeddingService(
-        base_url=os.environ["OPENAI_BASE_URL"],
-        model=os.environ.get("EMBEDDING_MODEL", "mxbai-embed-large"),
+        api_key=settings.openai_api_key,
+        model=settings.embedding_model,
     )
 
     app.state.circuit_breakers = CircuitBreakerRegistry(
         services={
-            "neo4j":          {"threshold": 5, "reset_timeout": 120},
-            "openai":         {"threshold": 5, "reset_timeout":  60},
-            "elasticsearch":  {"threshold": 5, "reset_timeout":  60},
+            "neo4j": {"threshold": 5, "reset_timeout": 120},
+            "openai": {"threshold": 5, "reset_timeout": 60},
+            "elasticsearch": {"threshold": 5, "reset_timeout": 60},
         }
     )
 
@@ -99,7 +103,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Restrict in production
+    allow_origins=["*"],  # Restrict in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -110,10 +114,9 @@ async def otel_middleware(request: Request, call_next):
     """OpenTelemetry span injection."""
     try:
         from opentelemetry import trace
+
         tracer = trace.get_tracer("agency-ontology-retrieval")
-        with tracer.start_as_current_span(
-            f"{request.method} {request.url.path}"
-        ):
+        with tracer.start_as_current_span(f"{request.method} {request.url.path}"):
             return await call_next(request)
     except Exception:
         return await call_next(request)
@@ -121,14 +124,15 @@ async def otel_middleware(request: Request, call_next):
 
 # ── Routers ────────────────────────────────────────────────────────────────────
 
-app.include_router(lookup.router,         prefix="/v1", tags=["lookup"])
-app.include_router(search.router,         prefix="/v1", tags=["search"])
-app.include_router(enrich.router,         prefix="/v1", tags=["enrich"])
+app.include_router(lookup.router, prefix="/v1", tags=["lookup"])
+app.include_router(search.router, prefix="/v1", tags=["search"])
+app.include_router(enrich.router, prefix="/v1", tags=["enrich"])
 app.include_router(schema_context.router, prefix="/v1", tags=["schema-context"])
-app.include_router(feedback.router,       prefix="/v1", tags=["feedback"])
+app.include_router(feedback.router, prefix="/v1", tags=["feedback"])
 
 
 # ── Health endpoints ───────────────────────────────────────────────────────────
+
 
 @app.get("/health", include_in_schema=False)
 async def health(request: Request) -> dict[str, Any]:
@@ -150,6 +154,11 @@ async def metrics():
     try:
         from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
         from fastapi.responses import Response
+
         return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
     except ImportError:
         return {"error": "prometheus_client not installed"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

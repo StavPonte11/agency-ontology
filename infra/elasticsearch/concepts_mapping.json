@@ -77,6 +77,73 @@
           "m": 16,
           "ef_construction": 100
         }
+      },
+      "is_class": {
+        "type": "boolean"
+      },
+      "is_deprecated": {
+        "type": "boolean"
+      },
+      "ancestor_ids": {
+        "type": "keyword"
+      },
+      "ancestor_names": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "instance_of": {
+        "type": "keyword"
+      },
+      "subclass_of": {
+        "type": "keyword"
+      },
+      "hierarchy_depth": {
+        "type": "integer"
+      },
+      "labels": {
+        "type": "nested",
+        "properties": {
+          "language": {
+            "type": "keyword"
+          },
+          "label": {
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword"
+              }
+            }
+          },
+          "description": {
+            "type": "text"
+          },
+          "aliases": {
+            "type": "text"
+          }
+        }
+      },
+      "statements": {
+        "type": "nested",
+        "properties": {
+          "property_id": {
+            "type": "keyword"
+          },
+          "property_label": {
+            "type": "text"
+          },
+          "value": {
+            "type": "text",
+            "fields": {
+              "keyword": {
+                "type": "keyword"
+              }
+            }
+          }
+        }
       }
     }
   },

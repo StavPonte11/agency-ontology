@@ -33,7 +33,7 @@ agency-ontology/
 │   │   ├── models/        ← Pydantic v2 models (ontology.py)
 │   │   ├── processors/    ← PDF processor, LLM extractor
 │   │   └── resolution/    ← Entity resolver
-│   └── retrieval-api/     ← FastAPI (5 endpoints: lookup, search, enrich, schema-context, feedback)
+│   └── retrieval_api/     ← FastAPI (5 endpoints: lookup, search, enrich, schema-context, feedback)
 │       ├── routers/
 │       ├── services/      ← Neo4j, Elasticsearch, Redis, circuit breaker, embedding
 │       └── main.py
@@ -70,7 +70,7 @@ agency-ontology/
 | Layer | Language | Location |
 |---|---|---|
 | Ingestion pipeline | Python (Kafka, Pydantic, LangChain) | `services/pipeline/` |
-| Retrieval API | Python (FastAPI, Neo4j, ES) | `services/retrieval-api/` |
+| Retrieval API | Python (FastAPI, Neo4j, ES) | `services/retrieval_api/` |
 | Agent tools (MCP) | TypeScript (Zod) | `packages/mcp-tools/` |
 | Type contracts | TypeScript (Zod) | `packages/shared-types/` |
 | Knowledge portal UI | TypeScript (Next.js, React Flow) | `apps/portal/` |
@@ -122,7 +122,7 @@ npm run dev
 ### 4. Start the Retrieval API
 
 ```bash
-cd services/retrieval-api
+cd services/retrieval_api
 uvicorn main:app --reload --port 8000
 ```
 

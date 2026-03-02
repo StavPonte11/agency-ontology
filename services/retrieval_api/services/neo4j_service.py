@@ -6,16 +6,29 @@ Hebrew military domain: returns Hebrew names as primary when available.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Optional
+
+from services.pipeline.models.ontology import (
+    ConceptRef,
+    ConceptStatus,
+    ConceptType,
+    DataAssetRef,
+    DataAssetType,
+    LookupResult,
+    MappingType,
+    NotFoundResult,
+    ProvenanceInfo,
+    RelatedConceptRef,
+)
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from neo4j.exceptions import ServiceUnavailable
 
-from ..models import (
-    ConceptRef, RelatedConceptRef, DataAssetRef, LookupResult,
-    NotFoundResult, ConceptType, ConceptStatus, SensitivityLevel,
-    MappingType, DataAssetType,
-)
+# from ..models import (
+#     ConceptRef, RelatedConceptRef, DataAssetRef, LookupResult,
+#     NotFoundResult, ConceptType, ConceptStatus, SensitivityLevel,
+#     MappingType, DataAssetType,
+# )
 
 logger = logging.getLogger(__name__)
 
@@ -204,7 +217,6 @@ class Neo4jService:
                 )
                 confidence = float(concept_node.get("confidence", 0.7))
 
-                from ..models import ProvenanceInfo
                 from datetime import datetime as dt
 
                 return LookupResult(
@@ -306,3 +318,176 @@ class Neo4jService:
                     })
 
         return tables, unmapped
+
+    # ── Hierarchy traversal methods ───────────────────────────────────────────
+
+    async def get_ancestors(self, concept_id: str) -> list[dict]:
+        """
+        Walk upward through the hierarchy (up to 10 hops).
+        Returns list of {concept_id, concept_name, depth, relation} dicts, nearest-first.
+        """
+        query = """
+        MATCH path = (c:Concept {id: $conceptId})
+          -[:INSTANCE_OF|SUBCLASS_OF|PART_OF_HIERARCHY*1..10]->(ancestor:Concept)
+        RETURN ancestor.id       AS concept_id,
+               ancestor.name     AS concept_name,
+               length(path)      AS depth,
+               [r IN relationships(path) | type(r)][length(path)-1] AS relation
+        ORDER BY depth ASC
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                return [dict(record) for record in await result.data()]
+        except Exception as exc:
+            logger.warning(f"get_ancestors failed for {concept_id}: {exc}")
+            return []
+
+    async def get_children(self, concept_id: str) -> dict[str, list[dict]]:
+        """
+        Get direct subclasses and instances of a concept (one hop down).
+        Returns {"subclasses": [...], "instances": [...]} each with {id, name, conceptType, domain}.
+        """
+        query = """
+        MATCH (child:Concept)-[r:INSTANCE_OF|SUBCLASS_OF]->(c:Concept {id: $conceptId})
+        RETURN child.id          AS id,
+               child.name        AS name,
+               child.conceptType AS concept_type,
+               child.domain      AS domain,
+               type(r)           AS relation_type
+        ORDER BY child.name ASC
+        LIMIT 50
+        """
+        subclasses, instances = [], []
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                async for record in result:
+                    entry = {"id": record["id"], "name": record["name"],
+                             "concept_type": record["concept_type"],
+                             "domain": record["domain"] or []}
+                    if record["relation_type"] == "SUBCLASS_OF":
+                        subclasses.append(entry)
+                    else:
+                        instances.append(entry)
+        except Exception as exc:
+            logger.warning(f"get_children failed for {concept_id}: {exc}")
+        return {"subclasses": subclasses, "instances": instances}
+
+    async def get_siblings(self, concept_id: str) -> list[dict]:
+        """
+        Get sibling concepts: share a common parent class, not the concept itself.
+        Returns list of {id, name, shared_parent} dicts.
+        """
+        query = """
+        MATCH (c:Concept {id: $conceptId})-[:INSTANCE_OF|SUBCLASS_OF]->(parent:Concept)
+        MATCH (sibling:Concept)-[:INSTANCE_OF|SUBCLASS_OF]->(parent)
+        WHERE sibling.id <> $conceptId
+        RETURN sibling.id   AS id,
+               sibling.name AS name,
+               parent.name  AS shared_parent
+        LIMIT 20
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                return [dict(record) for record in await result.data()]
+        except Exception as exc:
+            logger.warning(f"get_siblings failed for {concept_id}: {exc}")
+            return []
+
+    async def get_concept_description(self, concept_id: str) -> Optional[dict]:
+        """Lightweight fetch of name + description for inherited context assembly."""
+        query = """
+        MATCH (c:Concept {id: $conceptId})
+        RETURN c.name AS name, c.description AS description
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                record = await result.single()
+                return dict(record) if record else None
+        except Exception as exc:
+            logger.warning(f"get_concept_description failed for {concept_id}: {exc}")
+            return None
+
+    async def find_concept_by_name(self, name: str) -> Optional[str]:
+        """Case-insensitive exact name lookup. Returns concept_id or None."""
+        query = """
+        MATCH (c:Concept)
+        WHERE toLower(c.name) = toLower($name)
+        RETURN c.id AS concept_id LIMIT 1
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, name=name)
+                record = await result.single()
+                return record["concept_id"] if record else None
+        except Exception as exc:
+            logger.warning(f"find_concept_by_name failed for {name!r}: {exc}")
+            return None
+
+    async def get_multilingual_labels(self, concept_id: str) -> list[dict]:
+        """Fetch all Label nodes attached to a concept."""
+        query = """
+        MATCH (c:Concept {id: $conceptId})-[:HAS_LABEL]->(l:Label)
+        RETURN l.language AS language, l.label AS label,
+               l.description AS description, l.aliases AS aliases
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                return [dict(record) for record in await result.data()]
+        except Exception as exc:
+            logger.warning(f"get_multilingual_labels failed for {concept_id}: {exc}")
+            return []
+
+    async def get_statements(self, concept_id: str) -> list[dict]:
+        """Fetch all Statement nodes attached to a concept."""
+        query = """
+        MATCH (c:Concept {id: $conceptId})-[:HAS_STATEMENT]->(s:Statement)
+        RETURN s.propertyId AS property_id, s.propertyLabel AS property_label,
+               s.valueType AS value_type, s.value AS value, s.confidence AS confidence
+        """
+        try:
+            async with self._driver.session() as session:
+                result = await session.run(query, conceptId=concept_id)
+                return [dict(record) for record in await result.data()]
+        except Exception as exc:
+            logger.warning(f"get_statements failed for {concept_id}: {exc}")
+            return []
+
+    async def assemble_inherited_context(
+        self,
+        concept_id: str,
+        ancestor_path: list[dict],
+        token_budget: int = 500,
+    ) -> Optional[str]:
+        """
+        Walk the ancestor path and collect descriptions from each ancestor class.
+        Assemble into a compact inherited context string for LLM consumption.
+        Stops when token_budget is exhausted.
+
+        Result format:
+        "Inherited context:
+        • As a [Territorial Brigade]: Regional military formation responsible for...
+        • As a [Brigade]: Combined arms military unit..."
+        """
+        if not ancestor_path:
+            return None
+
+        lines: list[str] = ["Inherited context:"]
+        tokens_used = 0
+
+        for step in ancestor_path:
+            ancestor = await self.get_concept_description(step["concept_id"])
+            if not ancestor or not ancestor.get("description"):
+                continue
+            line = f"• As a [{step['concept_name']}]: {ancestor['description']}"
+            line_tokens = len(line.split())
+            if tokens_used + line_tokens > token_budget:
+                break
+            lines.append(line)
+            tokens_used += line_tokens
+
+        return "\n".join(lines) if len(lines) > 1 else None

@@ -32,7 +32,7 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list"]
+      test: [ "CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -68,7 +68,7 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "changeme", "RETURN 1"]
+      test: [ "CMD", "cypher-shell", "-u", "neo4j", "-p", "changeme", "RETURN 1" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -94,7 +94,7 @@ services:
     volumes:
       - elasticsearch_data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:9200/_cluster/health" ]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -114,7 +114,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agency -d agency_ontology"]
+      test: [ "CMD-SHELL", "pg_isready -U agency -d agency_ontology" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -132,14 +132,14 @@ services:
     volumes:
       - mongodb_data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
       interval: 30s
       timeout: 10s
       retries: 5
 
-  # ── Redis 7.2 ─────────────────────────────────────────────────────────────
+  # ── Redis 7.4 ─────────────────────────────────────────────────────────────
   redis:
-    image: redis:7.2-alpine
+    image: redis:7.4-alpine
     container_name: agency-redis
     ports:
       - "6379:6379"
@@ -147,32 +147,122 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 3
 
-  # ── LangFuse (self-hosted) ────────────────────────────────────────────────
-  langfuse:
-    image: langfuse/langfuse:latest
-    container_name: agency-langfuse
+  # ── ClickHouse (required by Langfuse v3) ─────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: agency-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native TCP interface
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:8123/ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── LangFuse v3 Web (self-hosted) ─────────────────────────────────────────
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: agency-langfuse-web
     ports:
       - "3001:3000"
-    environment:
+    environment: &langfuse-env
       DATABASE_URL: postgresql://agency:changeme@postgres:5432/langfuse
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_CLUSTER_ENABLED: "false"   # CRITICAL: Disable ZooKeeper requirement
       NEXTAUTH_SECRET: changeme-langfuse-secret-replace-in-prod
       NEXTAUTH_URL: http://localhost:3001
       SALT: changeme-langfuse-salt-replace-in-prod
+      ENCRYPTION_KEY: a6d2e7f8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6
       TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # S3/Minio integration for large event storage
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      # Redis for caching/rate limiting
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Initialization
+      LANGFUSE_INIT_ORG_ID: agency-org
+      LANGFUSE_INIT_PROJECT_ID: agency-pipeline
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-agency-dev}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-agency-dev}
     depends_on:
       postgres:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/public/health"]
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3000/api/public/health" ]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
+
+  # ── LangFuse v3 Worker (processes async background jobs) ──────────────────
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: agency-langfuse-worker
+    environment:
+      <<: *langfuse-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── MinIO (S3 compatible storage for Langfuse) ───────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: agency-minio
+    ports:
+      - "9005:9000"   # API moved from 9090 to avoid Prometheus conflict
+      - "9001:9001"   # Console
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   # ── OpenTelemetry Collector ────────────────────────────────────────────────
   otel-collector:
@@ -180,12 +270,14 @@ services:
     container_name: agency-otel
     volumes:
       - ./otel/collector.yml:/etc/otel-collector-config.yaml:ro
-    command: ["--config=/etc/otel-collector-config.yaml"]
+    command: [ "--config=/etc/otel-collector-config.yaml" ]
     ports:
       - "4317:4317"   # OTLP gRPC
       - "4318:4318"   # OTLP HTTP
       - "8888:8888"   # Prometheus metrics (self)
       - "8889:8889"   # Prometheus exporter
+    networks:
+      - default
 
   # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
@@ -232,20 +324,34 @@ services:
       COLLECTOR_OTLP_ENABLED: "true"
 
   # ── GlitchTip (error tracking, Sentry-compatible) ─────────────────────────
-  glitchtip:
-    image: glitchtip/glitchtip:latest
-    container_name: agency-glitchtip
+  # glitchtip:
+  #   image: glitchtip/glitchtip:latest
+  #   container_name: agency-glitchtip
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     DATABASE_URL: postgresql://agency:changeme@postgres:5432/glitchtip
+  #     SECRET_KEY: changeme-glitchtip-secret-replace-in-prod
+  #     GLITCHTIP_DOMAIN: http://localhost:8000
+  #     DEFAULT_FROM_EMAIL: noreply@agency.internal
+  #     EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+  # ── Ollama (local LLM) ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agency-ollama
     ports:
-      - "8000:8000"
-    environment:
-      DATABASE_URL: postgresql://agency:changeme@postgres:5432/glitchtip
-      SECRET_KEY: changeme-glitchtip-secret-replace-in-prod
-      GLITCHTIP_DOMAIN: http://localhost:8000
-      DEFAULT_FROM_EMAIL: noreply@agency.internal
-      EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ── Pipeline workers (Python) ─────────────────────────────────────────────
   pipeline-worker:
@@ -265,7 +371,7 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:11434}
       OPENAI_MODEL: ${OPENAI_MODEL:-llama3.3:70b}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
-      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-placeholder}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-placeholder}
     depends_on:
@@ -282,11 +388,11 @@ services:
       - pipeline  # Only start with --profile pipeline
 
   # ── Retrieval API (FastAPI) ───────────────────────────────────────────────
-  retrieval-api:
+  retrieval_api:
     build:
-      context: ../services/retrieval-api
+      context: ../services/retrieval_api
       dockerfile: Dockerfile
-    container_name: agency-retrieval-api
+    container_name: agency-retrieval_api
     ports:
       - "8080:8080"
     environment:
@@ -299,7 +405,7 @@ services:
       POSTGRES_URL: postgresql://agency:changeme@postgres:5432/agency_ontology
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:11434}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
-      LANGFUSE_HOST: http://langfuse:3000
+      LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-placeholder}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-placeholder}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
@@ -328,3 +434,11 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  clickhouse_data:
+  ollama_data:
+  langfuse_minio_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
