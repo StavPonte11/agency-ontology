@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from config import settings
+from services.config import settings
 # ── Router imports (absolute, works with uvicorn module path) ──────────────────
 from services.retrieval_api.routers import (
     lookup,
@@ -26,6 +26,7 @@ from services.retrieval_api.routers import (
     schema_context,
     feedback,
     impact,
+    ingest,
 )
 from services.retrieval_api.services.impact_service import ImpactService
 from services.retrieval_api.services.cache_service import CacheService
@@ -146,7 +147,7 @@ app.include_router(enrich.router, prefix="/v1", tags=["enrich"])
 app.include_router(schema_context.router, prefix="/v1", tags=["schema-context"])
 app.include_router(feedback.router, prefix="/v1", tags=["feedback"])
 app.include_router(impact.router, prefix="/v1", tags=["impact"])
-
+app.include_router(ingest.router, prefix="/v1", tags=["ingest"])
 
 # ── Health endpoints ───────────────────────────────────────────────────────────
 

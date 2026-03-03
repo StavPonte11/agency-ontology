@@ -1,14 +1,19 @@
 """
 Excel Source Connector — Agency Ontology Impact Extension
 =========================================================
-Reads .xlsx / .xls dependency files with *unknown schema at dev time*.
+Reads .xlsx / .xls dependency files, including the known 36-column
+facility/site/component schema — or any schema with unknown layout.
 
-The schema detection pass is the critical UX gate:
-  1. ExcelConnector.detect_schema() samples the first 20 rows and
-     returns a DetectedSchema report.
-  2. The operator reviews and optionally overrides column assignments
-     in the Source Ingestion Manager UI.
-  3. Only after confirmation does ingestion run.
+Two-phase approach:
+  1. detect_schema() — heuristic column role detection (fast, no LLM).
+     Output shown to operator for confirmation before ingestion.
+  2. list_documents() — yields one SourceDocument per row.
+     Each document carries all 36 typed columns in raw_content.
+  3. FacilityRowImpactExtractor — LLM extraction from free-text columns.
+     Produces typed edges (FacilityRowExtractionOutput).
+
+The older ExcelDependencyExtractor is kept for backward-compatibility with
+the generic (unknown schema) flow.
 
 Every row produces either a committed result or a Review Queue item.
 Silent discards are forbidden — they corrupt the coverage score.
@@ -19,7 +24,7 @@ import io
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
 from pydantic import BaseModel, Field
@@ -35,27 +40,110 @@ from ..models.ontology import (
     DetectedColumnRole,
     DetectedSchema,
     ExcelDependencyExtraction,
+    FacilityRowExtractionOutput,
+    ExtractedImpactEdge,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ── Schema detection heuristics ───────────────────────────────────────────────
+# ── Known column schema (36 columns) ─────────────────────────────────────────
+# Maps exact (case-insensitive) column names → their roles.
+# This lets schema detection skip heuristics when the file matches exactly.
+
+_KNOWN_SCHEMA: dict[str, DetectedColumnRole] = {
+    "id":                                        DetectedColumnRole.META,
+    "site_name":                                 DetectedColumnRole.LOCATION_ID,
+    "facility_name":                             DetectedColumnRole.FACILITY_ID,
+    "component_name":                            DetectedColumnRole.COMPONENT_ID,
+    "category":                                  DetectedColumnRole.CATEGORICAL,
+    "responsible_body":                          DetectedColumnRole.STRUCTURED_REF,
+    "system":                                    DetectedColumnRole.STRUCTURED_REF,
+    "support_for_attack_effort":                 DetectedColumnRole.CATEGORICAL,
+    "support_for_defende_control_effort":        DetectedColumnRole.CATEGORICAL,
+    "support_for_defence_control_effort":        DetectedColumnRole.CATEGORICAL,
+    "support_for_intelligence_effort":           DetectedColumnRole.CATEGORICAL,
+    "support_for_allert_effort":                 DetectedColumnRole.CATEGORICAL,
+    "support_for_alert_effort":                  DetectedColumnRole.CATEGORICAL,
+    "support_for_national_effort":               DetectedColumnRole.CATEGORICAL,
+    "ploygon":                                   DetectedColumnRole.GEO,
+    "polygon":                                   DetectedColumnRole.GEO,
+    "central_point":                             DetectedColumnRole.GEO,
+    "details_on_facilty_purpose":                DetectedColumnRole.FREE_TEXT,
+    "details_on_facility_purpose":               DetectedColumnRole.FREE_TEXT,
+    "operational_significance_if_damaged":       DetectedColumnRole.FREE_TEXT,
+    "sop_if_damaged":                            DetectedColumnRole.FREE_TEXT,
+    "deffence_with_iron_dome":                   DetectedColumnRole.CATEGORICAL,
+    "defence_with_iron_dome":                    DetectedColumnRole.CATEGORICAL,
+    "level_for_deffense_with_upper_layer":       DetectedColumnRole.CATEGORICAL,
+    "level_for_defence_with_upper_layer":        DetectedColumnRole.CATEGORICAL,
+    "system_information":                        DetectedColumnRole.FREE_TEXT,
+    "component_importance_to_system":            DetectedColumnRole.FREE_TEXT,
+    "hardering":                                 DetectedColumnRole.META,
+    "hardening":                                 DetectedColumnRole.META,
+    "concelaments":                              DetectedColumnRole.META,
+    "concealment":                               DetectedColumnRole.META,
+    "sidtibution":                               DetectedColumnRole.META,
+    "distribution":                              DetectedColumnRole.META,
+    "distribution_details":                      DetectedColumnRole.FREE_TEXT,
+    "recovery_capability":                       DetectedColumnRole.META,
+    "redundency":                                DetectedColumnRole.META,
+    "redundancy":                                DetectedColumnRole.META,
+    "redundency_details":                        DetectedColumnRole.FREE_TEXT,
+    "redundancy_details":                        DetectedColumnRole.FREE_TEXT,
+    "primary_backup":                            DetectedColumnRole.STRUCTURED_REF,
+    "secondary_primary":                         DetectedColumnRole.STRUCTURED_REF,
+    "mobility":                                  DetectedColumnRole.META,
+    "related_facilty":                           DetectedColumnRole.STRUCTURED_REF,
+    "related_facility":                          DetectedColumnRole.STRUCTURED_REF,
+    "connected_power_station":                   DetectedColumnRole.STRUCTURED_REF,
+    "connection_to_strategic_fuel_reserves":     DetectedColumnRole.STRUCTURED_REF,
+    "refined_coordinate":                        DetectedColumnRole.GEO,
+    "site_by_aerial_defense":                    DetectedColumnRole.STRUCTURED_REF,
+}
+
+# ── Heuristic hint sets for unknown/generic schemas ───────────────────────────
 
 _LOCATION_HINTS = {
-    "location", "loc", "site", "building", "base", "address",
+    "location", "loc", "site", "site_name", "building", "base", "address",
     "facility", "zone", "segment", "מיקום", "אתר", "בסיס",
 }
+_FACILITY_HINTS = {"facility_name", "facility", "building_name"}
+_COMPONENT_HINTS = {"component_name", "component"}
 _DEPENDENCY_HINTS = {
     "dependency", "dependencies", "dep", "uses", "contains", "hosts",
     "departments", "department", "projects", "project", "assets",
     "systems", "personnel", "תלות", "תלויות", "מחלקות",
 }
 _DESCRIPTION_HINTS = {
-    "description", "desc", "notes", "remarks", "details", "תיאור", "הערות",
+    "description", "desc", "notes", "remarks", "details", "purpose",
+    "details_on_facilty_purpose", "details_on_facility_purpose",
+    "תיאור", "הערות",
 }
+_FREE_TEXT_HINTS = {
+    "operational_significance_if_damaged", "sop_if_damaged",
+    "system_information", "component_importance_to_system",
+    "distribution_details", "redundency_details", "redundancy_details",
+}
+_STRUCTURED_REF_HINTS = {
+    "primary_backup", "secondary_primary", "related_facilty", "related_facility",
+    "connected_power_station", "connection_to_strategic_fuel_reserves",
+    "responsible_body", "system", "site_by_aerial_defense",
+}
+_CATEGORICAL_HINTS = {
+    "support_for_attack_effort", "support_for_defende_control_effort",
+    "support_for_defence_control_effort", "support_for_intelligence_effort",
+    "support_for_allert_effort", "support_for_alert_effort",
+    "support_for_national_effort", "deffence_with_iron_dome",
+    "defence_with_iron_dome", "level_for_deffense_with_upper_layer",
+    "level_for_defence_with_upper_layer", "central_point",
+}
+_GEO_HINTS = {"ploygon", "polygon", "central_point", "refined_coordinate", "coordinate", "geo"}
 _META_HINTS = {
-    "region", "tier", "status", "type", "category", "criticality",
+    "region", "tier", "status", "type", "category", "criticality", "id",
+    "hardering", "hardening", "concelaments", "concealment",
+    "sidtibution", "distribution", "recovery_capability",
+    "redundency", "redundancy", "mobility",
     "אזור", "קריטיות", "סטטוס",
 }
 
@@ -63,10 +151,27 @@ _META_HINTS = {
 def _detect_column_role(col_name: str, sample_values: list[str]) -> DetectedColumnRole:
     """Heuristic role detection from column name and sample values."""
     name_lower = col_name.lower().strip()
+
+    # Check known schema first
+    if name_lower in _KNOWN_SCHEMA:
+        return _KNOWN_SCHEMA[name_lower]
+
     words = set(name_lower.replace("-", " ").replace("_", " ").split())
 
-    if words & _LOCATION_HINTS:
+    if words & _LOCATION_HINTS or name_lower in _LOCATION_HINTS:
         return DetectedColumnRole.LOCATION_ID
+    if words & _FACILITY_HINTS or name_lower in _FACILITY_HINTS:
+        return DetectedColumnRole.FACILITY_ID
+    if words & _COMPONENT_HINTS or name_lower in _COMPONENT_HINTS:
+        return DetectedColumnRole.COMPONENT_ID
+    if name_lower in _FREE_TEXT_HINTS:
+        return DetectedColumnRole.FREE_TEXT
+    if name_lower in _STRUCTURED_REF_HINTS:
+        return DetectedColumnRole.STRUCTURED_REF
+    if name_lower in _CATEGORICAL_HINTS:
+        return DetectedColumnRole.CATEGORICAL
+    if name_lower in _GEO_HINTS:
+        return DetectedColumnRole.GEO
     if words & _DEPENDENCY_HINTS:
         return DetectedColumnRole.DEPENDENCY
     if words & _DESCRIPTION_HINTS:
@@ -78,10 +183,8 @@ def _detect_column_role(col_name: str, sample_values: list[str]) -> DetectedColu
     if sample_values:
         avg_len = sum(len(v) for v in sample_values) / len(sample_values)
         if avg_len > 60:
-            # Long free-text → likely dependency or description
-            return DetectedColumnRole.DEPENDENCY
+            return DetectedColumnRole.FREE_TEXT
         if avg_len < 20:
-            # Short values → likely identifier or metadata
             return DetectedColumnRole.META
 
     return DetectedColumnRole.UNKNOWN
@@ -95,20 +198,28 @@ def detect_schema_heuristic(
     """
     Pure heuristic schema detection — no LLM call required.
     Used as a fast baseline; the UI lets operators override any column.
+
+    Now recognises the known 36-column facility schema directly.
     """
     sample_rows = rows[:max_sample]
     columns: list[DetectedColumn] = []
     warnings: list[str] = []
 
     location_col: Optional[str] = None
+    facility_col: Optional[str] = None
+    component_col: Optional[str] = None
     dep_cols: list[str] = []
+    free_text_cols: list[str] = []
+    structured_ref_cols: list[str] = []
+    categorical_cols: list[str] = []
+    geo_cols: list[str] = []
     desc_cols: list[str] = []
     meta_cols: list[str] = []
 
     # Detect merged-cell markers (openpyxl leaves None for merged cells)
     none_counts = {h: sum(1 for r in sample_rows if r.get(h) is None) for h in headers}
     for h, cnt in none_counts.items():
-        if cnt > len(sample_rows) * 0.5:
+        if cnt > len(sample_rows) * 0.5 and len(sample_rows) > 0:
             warnings.append(
                 f"Column '{h}' has > 50% empty cells — possible merged cell or sparse data"
             )
@@ -117,11 +228,21 @@ def detect_schema_heuristic(
     for h in headers:
         vals = [str(r[h]) for r in sample_rows if r.get(h) is not None][:5]
         role = _detect_column_role(h, vals)
-        col_conf = 0.9 if role != DetectedColumnRole.UNKNOWN else 0.4
-        # Boost confidence if first column looks like an ID
+
+        # Confidence: high for known schema columns, lower for heuristic
+        h_lower = h.lower().strip()
+        if h_lower in _KNOWN_SCHEMA:
+            col_conf = 0.98
+        elif role != DetectedColumnRole.UNKNOWN:
+            col_conf = 0.85
+        else:
+            col_conf = 0.4
+
+        # First column fallback
         if h == headers[0] and role == DetectedColumnRole.UNKNOWN:
             role = DetectedColumnRole.LOCATION_ID
-            col_conf = 0.7
+            col_conf = 0.6
+
         columns.append(DetectedColumn(
             column_name=h,
             detected_role=role,
@@ -132,6 +253,18 @@ def detect_schema_heuristic(
 
         if role == DetectedColumnRole.LOCATION_ID and location_col is None:
             location_col = h
+        elif role == DetectedColumnRole.FACILITY_ID and facility_col is None:
+            facility_col = h
+        elif role == DetectedColumnRole.COMPONENT_ID and component_col is None:
+            component_col = h
+        elif role == DetectedColumnRole.FREE_TEXT:
+            free_text_cols.append(h)
+        elif role == DetectedColumnRole.STRUCTURED_REF:
+            structured_ref_cols.append(h)
+        elif role == DetectedColumnRole.CATEGORICAL:
+            categorical_cols.append(h)
+        elif role == DetectedColumnRole.GEO:
+            geo_cols.append(h)
         elif role == DetectedColumnRole.DEPENDENCY:
             dep_cols.append(h)
         elif role == DetectedColumnRole.LOCATION_DESC:
@@ -139,21 +272,26 @@ def detect_schema_heuristic(
         elif role == DetectedColumnRole.META:
             meta_cols.append(h)
 
-    # Fallback: if no location column found, use first column
+    # Fallbacks
     if not location_col and headers:
         location_col = headers[0]
         warnings.append(
-            f"No confident location column found — defaulting to '{location_col}'. "
+            f"No confident site/location column found — defaulting to '{location_col}'. "
             "Please verify in the UI before running ingestion."
         )
 
-    # Fallback: if no dep columns, try to infer from remaining non-location columns
-    if not dep_cols:
-        remaining = [h for h in headers if h != location_col and h not in desc_cols and h not in meta_cols]
+    if not dep_cols and not free_text_cols:
+        remaining = [
+            h for h in headers
+            if h not in [location_col, facility_col, component_col]
+            and h not in desc_cols and h not in meta_cols
+            and h not in structured_ref_cols and h not in categorical_cols
+            and h not in geo_cols
+        ]
         if remaining:
             dep_cols = remaining
             warnings.append(
-                f"No dependency columns confidently detected. "
+                f"No dependency/free-text columns confidently detected. "
                 f"Defaulting to: {dep_cols}. Please verify."
             )
 
@@ -162,9 +300,9 @@ def detect_schema_heuristic(
     return DetectedSchema(
         columns=columns,
         location_column=location_col or (headers[0] if headers else ""),
-        dependency_columns=dep_cols,
+        dependency_columns=dep_cols + free_text_cols,
         description_columns=desc_cols,
-        meta_columns=meta_cols,
+        meta_columns=meta_cols + categorical_cols + geo_cols,
         total_rows=len(rows),
         sample_rows=[{k: str(v) for k, v in r.items()} for r in rows[:5]],
         detection_confidence=overall_conf,
@@ -176,7 +314,7 @@ def detect_schema_heuristic(
 
 class ReviewQueueItem(BaseModel):
     """A row that could not be fully committed — queued for human review.
-    No row is ever silently discarded (spec Part 3.1 hard contract).
+    No row is ever silently discarded.
     """
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     source_file: str
@@ -184,22 +322,15 @@ class ReviewQueueItem(BaseModel):
     raw_row: dict[str, Any]
     location_name: Optional[str] = None
     reason: str
-    llm_extraction: Optional[ExcelDependencyExtraction] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    llm_extraction: Optional[FacilityRowExtractionOutput] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ── Excel Connector ───────────────────────────────────────────────────────────
 
 class ExcelConnector(SourceConnector):
     """
-    Source connector for Excel dependency files with unknown schema.
-
-    Usage:
-        connector = ExcelConnector(file_path="/path/to/deps.xlsx")
-        schema = await connector.detect_schema()
-        # → show schema to operator in UI, get confirmation / overrides
-        async for doc in connector.list_documents(schema_overrides=confirmed_schema):
-            pipeline.process(doc)
+    Source connector for Excel dependency files with unknown OR known schema.
     """
 
     connector_type = ConnectorType.EXCEL
@@ -208,8 +339,8 @@ class ExcelConnector(SourceConnector):
         self,
         file_path: str,
         connector_id: str = "excel-manual",
-        llm_client: Optional[Any] = None,   # langchain LLM for dep extraction
-        sheet_name: Optional[str | int] = 0,  # None = all sheets
+        llm_client: Optional[Any] = None,
+        sheet_name: Optional[str | int] = 0,
     ) -> None:
         self._file_path = file_path
         self._connector_id = connector_id
@@ -242,10 +373,8 @@ class ExcelConnector(SourceConnector):
             "required": ["file_path"],
         }
 
-    # ── Schema detection ──────────────────────────────────────────────────────
-
     def _read_excel_raw(self) -> tuple[list[str], list[dict[str, Any]]]:
-        """Read Excel file into headers + rows list. Handles multi-sheet."""
+        """Read Excel file into headers + rows list."""
         try:
             import openpyxl
         except ImportError:
@@ -257,7 +386,6 @@ class ExcelConnector(SourceConnector):
         wb = openpyxl.load_workbook(self._file_path, data_only=True)
 
         if self._sheet_name is None:
-            # Multi-sheet: concatenate all sheets
             all_rows: list[dict[str, Any]] = []
             headers: list[str] = []
             for sheet in wb.worksheets:
@@ -282,27 +410,22 @@ class ExcelConnector(SourceConnector):
             return headers, data
 
     async def detect_schema(self) -> DetectedSchema:
-        """
-        Schema detection pass — samples first 20 rows, returns DetectedSchema.
-        This result MUST be shown to the operator for confirmation before ingestion.
-        The operator can override any column assignment.
-        """
+        """Schema detection pass."""
         headers, rows = self._read_excel_raw()
         schema = detect_schema_heuristic(headers, rows, max_sample=20)
         logger.info(
             f"Schema detected for '{self._file_path}': "
             f"location_col='{schema.location_column}' "
-            f"dep_cols={schema.dependency_columns} "
             f"confidence={schema.detection_confidence:.2f}"
         )
         return schema
 
     async def get_document(self, external_id: str) -> SourceDocument:
-        """Fetch a single row by its external_id (row index string)."""
+        """Fetch a single row by its external_id."""
         _, rows = self._read_excel_raw()
         idx = int(external_id.split("::row::")[-1])
         if idx >= len(rows):
-            raise ValueError(f"Row index {idx} out of range (total rows: {len(rows)})")
+            raise ValueError(f"Row index {idx} out of range")
         row = rows[idx]
         content_hash = SourceDocument.compute_hash(row)
         return SourceDocument(
@@ -321,89 +444,92 @@ class ExcelConnector(SourceConnector):
         since: Optional[datetime] = None,
         schema_overrides: Optional[DetectedSchema] = None,
     ) -> AsyncIterator[SourceDocument]:
-        """
-        Yield one SourceDocument per Excel row.
-
-        Each row that cannot be fully parsed produces a ReviewQueueItem
-        (stored in self.review_queue) AND still yields a SourceDocument
-        with review_needed=True in metadata.
-
-        INVARIANT: total yielded documents == total_rows.
-        No row is ever silently dropped.
-        """
+        """Yield one SourceDocument per Excel row."""
         headers, rows = self._read_excel_raw()
         schema = schema_overrides or await self.detect_schema()
 
         loc_col = schema.location_column
-        dep_cols = schema.dependency_columns
-        desc_cols = schema.description_columns
+
+        def _cols_for_role(role: DetectedColumnRole) -> list[str]:
+            return [c.column_name for c in schema.columns if c.detected_role == role]
+
+        facility_cols = _cols_for_role(DetectedColumnRole.FACILITY_ID)
+        component_cols = _cols_for_role(DetectedColumnRole.COMPONENT_ID)
+        free_text_cols = _cols_for_role(DetectedColumnRole.FREE_TEXT)
+        structured_ref_cols = _cols_for_role(DetectedColumnRole.STRUCTURED_REF)
+        categorical_cols = _cols_for_role(DetectedColumnRole.CATEGORICAL)
+        geo_cols = _cols_for_role(DetectedColumnRole.GEO)
+        dep_cols = _cols_for_role(DetectedColumnRole.DEPENDENCY)
+        desc_cols = _cols_for_role(DetectedColumnRole.LOCATION_DESC)
 
         for idx, row in enumerate(rows):
-            # Skip completely empty rows (e.g. section headers in raw Excel)
             if all(v is None or str(v).strip() == "" for v in row.values()):
-                logger.debug(f"Skipping empty row {idx}")
                 continue
 
             external_id = f"{self._connector_id}::row::{idx}"
-            location_name = str(row.get(loc_col, "")).strip()
-            dep_text = " | ".join(
-                str(row.get(col, "")).strip()
-                for col in dep_cols
-                if row.get(col)
-            )
-            description = " ".join(
-                str(row.get(col, "")).strip()
-                for col in desc_cols
-                if row.get(col)
-            )
+
+            def _get(col: str) -> str:
+                v = row.get(col)
+                return str(v).strip() if v is not None else ""
+
+            site_name = _get(loc_col)
+            facility_name = _get(facility_cols[0]) if facility_cols else ""
+            component_name = _get(component_cols[0]) if component_cols else ""
+
+            dep_text = " | ".join(_get(col) for col in dep_cols + free_text_cols if _get(col))
+            structured_refs = {col: _get(col) for col in structured_ref_cols if _get(col)}
+            categoricals = {col: _get(col) for col in categorical_cols if _get(col)}
+            free_texts = {col: _get(col) for col in free_text_cols if _get(col)}
+            geos = {col: _get(col) for col in geo_cols if _get(col)}
+            meta = {
+                col: _get(col)
+                for col in headers
+                if col not in [loc_col] + facility_cols + component_cols + free_text_cols + 
+                   structured_ref_cols + categorical_cols + geo_cols + dep_cols + desc_cols
+                and _get(col)
+            }
 
             review_needed = False
             review_reason = ""
 
-            if not location_name:
+            if not site_name:
                 review_needed = True
-                review_reason = "Missing location name in location column"
+                review_reason = "Missing site_name"
                 self._review_queue.append(ReviewQueueItem(
                     source_file=self._file_path,
                     row_index=idx,
                     raw_row={k: str(v) for k, v in row.items()},
-                    location_name=None,
                     reason=review_reason,
                 ))
 
-            if not dep_text and not review_needed:
-                review_needed = True
-                review_reason = "No dependency text in dependency columns"
-                self._review_queue.append(ReviewQueueItem(
-                    source_file=self._file_path,
-                    row_index=idx,
-                    raw_row={k: str(v) for k, v in row.items()},
-                    location_name=location_name or None,
-                    reason=review_reason,
-                ))
-
-            content = {
-                "location_name": location_name,
+            full_content = {
+                "site_name": site_name,
+                "facility_name": facility_name,
+                "component_name": component_name,
+                "structured_refs": structured_refs,
+                "categoricals": categoricals,
+                "free_texts": free_texts,
+                "geos": geos,
+                "meta": meta,
+                "location_name": site_name,
                 "dependency_text": dep_text,
-                "description": description,
+                "description": " ".join(_get(col) for col in desc_cols if _get(col)),
                 "raw_row": {k: str(v) for k, v in row.items() if v is not None},
                 "row_index": idx,
                 "review_needed": review_needed,
                 "review_reason": review_reason,
             }
-            content_hash = SourceDocument.compute_hash(content)
+            content_hash = SourceDocument.compute_hash(full_content)
+            title = site_name or facility_name or f"Row {idx}"
 
             yield SourceDocument(
                 external_id=external_id,
-                title=location_name or f"Row {idx} (unnamed)",
+                title=title,
                 content_type="excel_row",
-                raw_content=content,
+                raw_content=full_content,
                 metadata={
                     "row_index": idx,
                     "review_needed": review_needed,
-                    "review_reason": review_reason,
-                    "location_column": loc_col,
-                    "dependency_columns": dep_cols,
                 },
                 content_hash=content_hash,
                 document_type="EXCEL_ROW",
@@ -413,81 +539,72 @@ class ExcelConnector(SourceConnector):
 
     @property
     def review_queue(self) -> list[ReviewQueueItem]:
-        """Items queued for human review after list_documents() has run."""
         return list(self._review_queue)
 
-    def clear_review_queue(self) -> None:
-        """Clear review queue (call after items have been processed)."""
-        self._review_queue.clear()
 
+# ── Facility Row Impact Extractor (LLM) ───────────────────────────────────────
 
-# ── LLM Dependency Extractor (per-row LLM chain) ─────────────────────────────
+class FacilityRowImpactExtractor:
+    """LLM-based extractor for free-text columns."""
 
-class ExcelDependencyExtractor:
-    """
-    Parses raw dependency text from an Excel row into structured entities.
-    Uses with_structured_output on ExcelDependencyExtraction Pydantic model.
-
-    This is always called AFTER schema detection and operator confirmation.
-    """
-
-    _SYSTEM_PROMPT = """You are an expert at parsing organizational dependency text
-from Excel spreadsheets. Your task: extract all entities and relationships
-described in the dependency text for a specific location.
-
-For each entity mentioned, determine:
-- entity_name: exact name as written
-- entity_type: DEPARTMENT | PROJECT | ASSET | SYSTEM | PERSONNEL | CLIENT | PROCESS | OBLIGATION
-- edge_type: HOSTS | RUNS | OPERATES | SERVES | USES | STAFFED_BY | FEEDS | BLOCKS
-- edge_criticality: CRITICAL | HIGH | MEDIUM | LOW
-- notes: any qualifying notes (e.g. "no backup", "can operate remotely")
-
-IMPORTANT for operational_status_hints:
-- If the text says "planned", "future", "not yet operational", "in progress" → PLANNED
-- If the text says "suspended", "on hold", "paused" → SUSPENDED
-- Otherwise → ACTIVE (default)
-
-Return ALL entities mentioned. If the text is ambiguous or incomplete,
-set review_needed=true and explain in review_reason.
-"""
+    _SYSTEM_PROMPT = """\
+You are an expert analyst. Extract dependency edges from free-text fields.
+Identify: from_entity, from_type, to_entity, to_type, edge_type, criticality, source_column.
+Rules: Extract only explicit/implied info. Use SITE|FACILITY|COMPONENT|SYSTEM types.
+Return empty edges list if nothing found."""
 
     def __init__(self, llm_client: Any) -> None:
-        """
-        llm_client: a LangChain ChatOpenAI / ChatOllama instance.
-        Will be wrapped with .with_structured_output(ExcelDependencyExtraction).
-        """
-        self._chain = llm_client.with_structured_output(ExcelDependencyExtraction)
+        self._chain = llm_client.with_structured_output(FacilityRowExtractionOutput)
 
     async def extract(
         self,
-        location_name: str,
-        dep_text: str,
-        description: str = "",
-    ) -> ExcelDependencyExtraction:
-        """Extract entities from a single row's dependency text."""
+        site_name: str,
+        facility_name: str,
+        component_name: str,
+        free_texts: dict[str, str],
+    ) -> FacilityRowExtractionOutput:
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        if not any(free_texts.values()):
+            return FacilityRowExtractionOutput(
+                facility_name=facility_name or site_name,
+                edges=[],
+                review_needed=False,
+                confidence=1.0,
+            )
+
+        col_sections = "\n".join(f"[{col}]\n{val}" for col, val in free_texts.items() if val)
         human_content = (
-            f"Location: {location_name}\n"
-            f"Description: {description}\n"
-            f"Dependency text: {dep_text}\n\n"
-            "Extract all entities and relationships from the dependency text above."
+            f"Site: {site_name}\nFacility: {facility_name}\nComponent: {component_name}\n\n"
+            f"FIELDS:\n{col_sections}"
         )
-        messages = [
-            SystemMessage(content=self._SYSTEM_PROMPT),
-            HumanMessage(content=human_content),
-        ]
         try:
-            result = await self._chain.ainvoke(messages)
+            result = await self._chain.ainvoke([
+                SystemMessage(content=self._SYSTEM_PROMPT),
+                HumanMessage(content=human_content),
+            ])
             return result
         except Exception as exc:
-            logger.warning(
-                f"LLM extraction failed for location '{location_name}': {exc}"
-            )
-            return ExcelDependencyExtraction(
-                location_name=location_name,
-                entities=[],
+            return FacilityRowExtractionOutput(
+                facility_name=facility_name or site_name,
+                edges=[],
                 review_needed=True,
-                review_reason=f"LLM extraction failed: {exc}",
+                review_reason=str(exc),
                 confidence=0.0,
             )
+
+
+class ExcelDependencyExtractor:
+    """Legacy generic extractor."""
+    def __init__(self, llm_client: Any) -> None:
+        self._chain = llm_client.with_structured_output(ExcelDependencyExtraction)
+
+    async def extract(self, location_name: str, dep_text: str, description: str = "") -> Any:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        try:
+            return await self._chain.ainvoke([
+                SystemMessage(content="Legacy extractor"),
+                HumanMessage(content=f"{location_name}: {dep_text}"),
+            ])
+        except Exception:
+            return ExcelDependencyExtraction(location_name=location_name, entities=[], confidence=0.0)

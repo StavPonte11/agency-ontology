@@ -1,5 +1,11 @@
+import sys
+import asyncio
 import pytest
 from unittest.mock import AsyncMock
+
+# Fix for "NoneType object has no attribute send" in proactor_events.py on Windows teardown
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 @pytest.fixture
 def mock_neo4j():

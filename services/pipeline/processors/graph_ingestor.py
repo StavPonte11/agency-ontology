@@ -278,6 +278,111 @@ MATCH (doc:Document {id: $doc_id})
 MERGE (c)-[:SOURCED_FROM]->(doc)
 """
 
+# ── Impact domain: Site / Facility / Component node Cypher ────────────────────
+
+_MERGE_SITE = """
+MERGE (s:Site {name: $name})
+ON CREATE SET
+    s.nodeType      = 'SITE',
+    s.category      = $category,
+    s.sourceFile    = $source_file,
+    s.createdAt     = datetime()
+ON MATCH SET
+    s.updatedAt     = datetime()
+RETURN s.name AS site_name
+"""
+
+_MERGE_FACILITY = """
+MERGE (f:Facility {name: $name, siteName: $site_name})
+ON CREATE SET
+    f.nodeType                    = 'FACILITY',
+    f.siteName                    = $site_name,
+    f.category                    = $category,
+    f.responsibleBody             = $responsible_body,
+    f.system                      = $system,
+    f.supportAttackEffort         = $support_attack,
+    f.supportDefenceControlEffort = $support_defence,
+    f.supportIntelligenceEffort   = $support_intel,
+    f.supportAlertEffort          = $support_alert,
+    f.supportNationalEffort       = $support_national,
+    f.defenceWithIronDome         = $defence_iron_dome,
+    f.levelForDefenceUpperLayer   = $defence_upper_layer,
+    f.hardening                   = $hardening,
+    f.concealment                 = $concealment,
+    f.distribution                = $distribution,
+    f.recoveryCapability          = $recovery_capability,
+    f.redundancy                  = $redundancy,
+    f.mobility                    = $mobility,
+    f.polygon                     = $polygon,
+    f.centralPoint                = $central_point,
+    f.refinedCoordinate           = $refined_coordinate,
+    f.operationalSignificance     = $operational_significance,
+    f.mitigation_procedures        = $mitigation_procedures,
+    f.sourceFile                  = $source_file,
+    f.createdAt                   = datetime()
+ON MATCH SET
+    f.updatedAt               = datetime(),
+    f.responsibleBody         = CASE WHEN $responsible_body <> '' THEN $responsible_body ELSE f.responsibleBody END,
+    f.defenceWithIronDome     = CASE WHEN $defence_iron_dome <> '' THEN $defence_iron_dome ELSE f.defenceWithIronDome END,
+    f.operationalSignificance = CASE WHEN $operational_significance IS NOT NULL THEN $operational_significance ELSE f.operationalSignificance END,
+    f.mitigation_procedures    = CASE WHEN $mitigation_procedures IS NOT NULL THEN $mitigation_procedures ELSE f.mitigation_procedures END
+RETURN f.name AS facility_name
+"""
+
+_MERGE_COMPONENT = """
+MERGE (c:Component {name: $name, facilityName: $facility_name, siteName: $site_name})
+ON CREATE SET
+    c.nodeType      = 'COMPONENT',
+    c.facilityName  = $facility_name,
+    c.siteName      = $site_name,
+    c.category      = $category,
+    c.system        = $system,
+    c.sourceFile    = $source_file,
+    c.createdAt     = datetime()
+ON MATCH SET
+    c.updatedAt     = datetime()
+RETURN c.name AS component_name
+"""
+
+# Generic node MERGEs for reference targets
+_MERGE_GENERIC_NODE = """
+MERGE (n:{label} {{name: $name}})
+ON CREATE SET n.nodeType = $node_type, n.createdAt = datetime()
+ON MATCH SET n.updatedAt = datetime()
+RETURN n.name AS name
+"""
+
+# Site -> Facility containment
+_MERGE_SITE_CONTAINS_FACILITY = """
+MATCH (s:Site {name: $site_name})
+MATCH (f:Facility {name: $facility_name, siteName: $site_name})
+MERGE (s)-[r:CONTAINS]->(f)
+ON CREATE SET r.createdAt = datetime()
+"""
+
+# Facility -> Component containment
+_MERGE_FACILITY_CONTAINS_COMPONENT = """
+MATCH (f:Facility {name: $facility_name, siteName: $site_name})
+MATCH (c:Component {name: $component_name, facilityName: $facility_name})
+MERGE (f)-[r:CONTAINS]->(c)
+ON CREATE SET r.createdAt = datetime()
+"""
+
+# Generic typed impact edge between any two named nodes
+# Edge type is injected as a string — we validate it against a safe allowlist
+_ALLOWED_EDGE_TYPES = {
+    "BACKUP_FOR", "RELATED_TO", "POWERED_BY", "FUELED_BY",
+    "OPERATED_BY", "PART_OF_SYSTEM", "PROTECTED_BY", "AERIAL_DEFENSE_ZONE",
+    "AFFECTS", "USES", "FEEDS", "CONTAINS", "HOSTS"
+}
+
+_MERGE_IMPACT_EDGE_BETWEEN_NAMES = """
+MERGE (from_n {{name: $from_name}})
+ON CREATE SET from_n.nodeType = $from_type, from_n.createdAt = datetime()
+MERGE (to_n {{name: $to_name}})
+ON CREATE SET to_n.nodeType = $to_type, to_n.createdAt = datetime()
+"""
+
 # ── Ingestor class ─────────────────────────────────────────────────────────────
 
 
@@ -326,6 +431,163 @@ class GraphIngestor:
             except Exception as exc:
                 logger.debug(f"Fulltext index creation skipped: {exc}")
         logger.info("Neo4j indexes and constraints are active.")
+
+    async def ingest_impact_row(
+        self,
+        row_content: dict[str, Any],
+        source_file: str,
+        llm_extraction: Optional[Any] = None,
+    ) -> dict[str, int]:
+        """
+        Ingest a single row from an Excel impact dataset into Neo4j.
+        Creates Site -> Facility -> Component hierarchy.
+        Creates structured edges based on column roles.
+        Creates LLM-extracted free-text edges.
+        """
+        stats = {"nodes": 0, "edges": 0}
+
+        site_name = row_content.get("site_name")
+        facility_name = row_content.get("facility_name")
+        component_name = row_content.get("component_name")
+        structured_refs = row_content.get("structured_refs", {})
+        categoricals = row_content.get("categoricals", {})
+        
+        if not site_name or not facility_name:
+            # Should have been caught by ReviewQueue, zero-op gracefully here
+            return stats
+
+        async with self._driver.session() as session:
+            # 1. Merge Site (Location)
+            res = await session.run("""
+                MERGE (s:Site {name: $site_name})
+                ON CREATE SET s.id = randomUUID(), s.createdAt = datetime()
+                RETURN s.id AS id
+            """, site_name=site_name)
+            if (await res.single()):
+                stats["nodes"] += 1
+
+            # 2. Merge Facility
+            res = await session.run("""
+                MERGE (f:Facility {name: $facility_name, site_name: $site_name})
+                ON CREATE SET 
+                    f.id = randomUUID(), 
+                    f.createdAt = datetime(),
+                    f.source_file = $source_file
+                SET f.category = $category
+                RETURN f.id AS id
+            """, 
+            facility_name=facility_name, 
+            site_name=site_name,
+            source_file=source_file,
+            category=categoricals.get("category", "") or "Unknown")
+            if (await res.single()):
+                stats["nodes"] += 1
+
+            # 3. Link Site -> Facility (CONTAINS)
+            res = await session.run("""
+                MATCH (s:Site {name: $site}), (f:Facility {name: $fac, site_name: $site})
+                MERGE (s)-[r:CONTAINS]->(f)
+                RETURN r
+            """, site=site_name, fac=facility_name)
+            if (await res.single()):
+                stats["edges"] += 1
+
+            # 4. Optional Component
+            if component_name:
+                res = await session.run("""
+                    MERGE (c:Component {name: $comp, facility_name: $fac})
+                    ON CREATE SET c.id = randomUUID(), c.createdAt = datetime()
+                    RETURN c.id AS id
+                """, comp=component_name, fac=facility_name)
+                if (await res.single()):
+                    stats["nodes"] += 1
+                
+                res = await session.run("""
+                    MATCH (f:Facility {name: $fac, site_name: $site}), (c:Component {name: $comp, facility_name: $fac})
+                    MERGE (f)-[r:CONTAINS]->(c)
+                    RETURN r
+                """, fac=facility_name, site=site_name, comp=component_name)
+                if (await res.single()):
+                    stats["edges"] += 1
+
+            # Determine the 'leaf' node that acts as the source for all outbound edges
+            # Usually the Component if it exists, otherwise the Facility.
+            source_node_type = "Component" if component_name else "Facility"
+            source_node_name = component_name if component_name else facility_name
+            fac_constraint = f", facility_name: '{facility_name}'" if component_name else f", site_name: '{site_name}'"
+
+            # 5. Process Structured Refs
+            edge_mapping = {
+                "primary_backup": "BACKUP_FOR",
+                "secondary_primary": "BACKUP_FOR", # Typo in dataset headers
+                "related_facilty": "RELATED_TO",
+                "connected_power_station": "POWERED_BY",
+                "connection_to_strategic_fuel_reserves": "FUELED_BY",
+                "responsible_body": "OPERATED_BY",
+                "system": "PART_OF_SYSTEM",
+                "site_by_aerial_defense": "AERIAL_DEFENSE_ZONE"
+            }
+            
+            for col_name, target_value in structured_refs.items():
+                if not target_value:
+                    continue
+                edge_type = edge_mapping.get(col_name.lower().strip(), "DEPENDS_ON")
+                
+                # Treat structured targets generally as Facilities for simplicity (unless specific like Operator/System)
+                target_label = "Facility"
+                if edge_type == "OPERATED_BY": target_label = "Department"
+                elif edge_type == "PART_OF_SYSTEM": target_label = "System"
+                
+                res = await session.run(f"""
+                    MERGE (t:{target_label} {{name: $target}})
+                    ON CREATE SET t.id = randomUUID(), t.createdAt = datetime()
+                    WITH t
+                    MATCH (src:{source_node_type} {{name: $src_name {fac_constraint} }})
+                    MERGE (src)-[r:{edge_type}]->(t)
+                    RETURN r
+                """, target=target_value, src_name=source_node_name)
+                if (await res.single()):
+                    stats["edges"] += 1
+
+            # 6. Process LLM Extracted Free-Text Edges
+            if llm_extraction and getattr(llm_extraction, "edges", None):
+                for edge in llm_extraction.edges:
+                    clean_type = str(edge.edge_type).replace(" ", "_").upper()
+                    # Ensure basic labels
+                    from_label = str(edge.from_type).capitalize() if edge.from_type else "Facility"
+                    to_label = str(edge.to_type).capitalize() if edge.to_type else "Facility"
+                    
+                    if from_label not in ["Site", "Facility", "Component", "System", "Department"]:
+                        from_label = "Facility"
+                    if to_label not in ["Site", "Facility", "Component", "System", "Department"]:
+                        to_label = "Facility"
+
+                    try:
+                        res = await session.run(f"""
+                            MERGE (from_n:{from_label} {{name: $from_name}})
+                            ON CREATE SET from_n.id = randomUUID(), from_n.createdAt = datetime()
+                            WITH from_n
+                            MERGE (to_n:{to_label} {{name: $to_name}})
+                            ON CREATE SET to_n.id = randomUUID(), to_n.createdAt = datetime()
+                            WITH from_n, to_n
+                            MERGE (from_n)-[r:{clean_type}]->(to_n)
+                            ON CREATE SET 
+                                r.criticality = $crit,
+                                r.source_column = $src_col,
+                                r.createdAt = datetime()
+                            RETURN r
+                        """, 
+                        from_name=edge.from_entity,
+                        to_name=edge.to_entity,
+                        crit=edge.criticality or "MEDIUM",
+                        src_col=edge.source_column or "LLM_Extracted")
+                        
+                        if (await res.single()):
+                            stats["edges"] += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to ingest LLM edge {edge.from_entity}-[{clean_type}]->{edge.to_entity}: {e}")
+
+        return stats
 
     async def ingest(
         self,

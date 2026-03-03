@@ -959,6 +959,29 @@ class DependencyEdgeType(str, Enum):
     FEEDS = "FEEDS"           # System -> System
     BLOCKS = "BLOCKS"         # Project -> Project (sequencing)
     STAFFED_BY = "STAFFED_BY" # Department | Project -> Personnel
+    # Extended edge types for facility/site Excel schema
+    CONTAINS = "CONTAINS"               # Site -> Facility, Facility -> Component
+    PART_OF_SYSTEM = "PART_OF_SYSTEM"   # Facility/Component -> System
+    OPERATED_BY = "OPERATED_BY"         # Facility -> ResponsibleBody
+    POWERED_BY = "POWERED_BY"           # Facility -> PowerStation
+    FUELED_BY = "FUELED_BY"             # Facility -> FuelReserve
+    PROTECTED_BY = "PROTECTED_BY"       # Facility -> DefenseSystem (Iron Dome, etc.)
+    AERIAL_DEFENSE_ZONE = "AERIAL_DEFENSE_ZONE"  # Facility -> AerialDefenseZone
+    RELATED_TO = "RELATED_TO"           # Facility -> RelatedFacility (generic)
+    AFFECTS = "AFFECTS"                 # Facility -> Facility (operational impact)
+
+
+class ImpactNodeType(str, Enum):
+    """Node types specific to the facility/site impact domain."""
+    SITE = "SITE"                       # Top-level site (site_name column)
+    FACILITY = "FACILITY"               # Facility within a site (facility_name column)
+    COMPONENT = "COMPONENT"             # Component within a facility (component_name column)
+    SYSTEM = "SYSTEM"                   # Named system (system column)
+    RESPONSIBLE_BODY = "RESPONSIBLE_BODY"  # Organization operating a facility
+    POWER_STATION = "POWER_STATION"     # Power station (connected_power_station)
+    FUEL_RESERVE = "FUEL_RESERVE"       # Fuel reserve (connection_to_strategic_fuel_reserves)
+    DEFENSE_SYSTEM = "DEFENSE_SYSTEM"   # Defense system (Iron Dome, upper layer, etc.)
+    AERIAL_DEFENSE_ZONE = "AERIAL_DEFENSE_ZONE"  # Aerial defense zone
 
 
 class DisruptionType(str, Enum):
@@ -1228,10 +1251,16 @@ class HistoricalIncidentExtractionOutput(BaseModel):
 
 class DetectedColumnRole(str, Enum):
     """Role a column plays in the Excel dependency schema."""
-    LOCATION_ID = "LOCATION_ID"       # primary location identifier
-    LOCATION_DESC = "LOCATION_DESC"   # location description/notes
-    DEPENDENCY = "DEPENDENCY"          # free-text dependency string
-    META = "META"                      # region, tier, status metadata
+    LOCATION_ID = "LOCATION_ID"         # primary location identifier (site_name)
+    FACILITY_ID = "FACILITY_ID"         # facility name within a site
+    COMPONENT_ID = "COMPONENT_ID"       # component name within a facility
+    LOCATION_DESC = "LOCATION_DESC"     # location description/notes
+    DEPENDENCY = "DEPENDENCY"           # free-text dependency string
+    STRUCTURED_REF = "STRUCTURED_REF"  # structured reference to another node (FK-like)
+    FREE_TEXT = "FREE_TEXT"             # free-text field for LLM extraction
+    CATEGORICAL = "CATEGORICAL"         # categorical/dropdown value
+    META = "META"                       # region, tier, status metadata
+    GEO = "GEO"                         # geographic/coordinate column
     UNKNOWN = "UNKNOWN"
 
 
@@ -1266,9 +1295,60 @@ class DetectedSchema(BaseModel):
     )
 
 
+class ExtractedImpactEdge(BaseModel):
+    """A single edge extracted from a free-text column in the facility Excel schema."""
+    from_entity: str = Field(description="Source entity name")
+    from_type: str = Field(description="Source node type: SITE | FACILITY | COMPONENT | SYSTEM")
+    to_entity: str = Field(description="Target entity name")
+    to_type: str = Field(description="Target node type: SITE | FACILITY | SYSTEM | RESPONSIBLE_BODY | POWER_STATION | etc.")
+    edge_type: str = Field(
+        description=(
+            "Edge type: CONTAINS | PART_OF_SYSTEM | OPERATED_BY | POWERED_BY | FUELED_BY | "
+            "PROTECTED_BY | AERIAL_DEFENSE_ZONE | RELATED_TO | BACKUP_FOR | AFFECTS | USES"
+        )
+    )
+    criticality: str = Field(default="MEDIUM", description="CRITICAL | HIGH | MEDIUM | LOW")
+    notes: Optional[str] = None
+    source_column: str = Field(description="Name of the column this edge was extracted from")
+    confidence: Confidence = Field(default=0.8)
+
+
+class FacilityRowExtractionOutput(BaseModel):
+    """LLM-extracted edges from free-text columns of a single facility Excel row.
+    Produced by FacilityRowImpactExtractor.extract() using with_structured_output.
+    Only the free-text columns are analyzed; structured columns produce edges directly.
+    """
+    facility_name: str = Field(description="Facility name from this row (for reference)")
+    edges: list[ExtractedImpactEdge] = Field(
+        description=(
+            "All dependency edges extracted from the free-text columns. "
+            "Each edge describes a relationship between entities mentioned in the text."
+        )
+    )
+    entity_refs: list[str] = Field(
+        default_factory=list,
+        description="All entity names mentioned in free-text columns (for resolution)"
+    )
+    operational_significance: Optional[str] = Field(
+        default=None,
+        description="Brief summary of operational significance if damaged (for display)"
+    )
+    mitigation_procedures: Optional[str] = Field(
+        default=None,
+        description="Brief summary of SOP/mitigation if damaged"
+    )
+    review_needed: bool = Field(
+        default=False,
+        description="True if row is ambiguous, partial, or confidence is low"
+    )
+    review_reason: Optional[str] = None
+    confidence: Confidence = 0.8
+
+
 class ExcelDependencyExtraction(BaseModel):
     """LLM-extracted dependencies from a single Excel row.
     Produced by with_structured_output on the dependency column text.
+    Kept for backward compatibility with original generic schema.
     """
     location_name: str = Field(description="Cleaned, canonical location name from this row")
     entities: list[dict[str, Any]] = Field(

@@ -284,6 +284,173 @@ def test_detect_column_role_long_values_is_dependency():
 
     long_vals = ["Department A runs Project X and also manages System Y with critical backup"] * 3
     role = _detect_column_role("col_1", long_vals)
-    assert role in (DetectedColumnRole.DEPENDENCY, DetectedColumnRole.LOCATION_DESC), (
-        f"Long text values should map to DEPENDENCY or LOCATION_DESC, got {role}"
+    assert role in (DetectedColumnRole.DEPENDENCY, DetectedColumnRole.LOCATION_DESC, DetectedColumnRole.FREE_TEXT), (
+        f"Long text values should map to DEPENDENCY, LOCATION_DESC or FREE_TEXT, got {role}"
     )
+
+
+# ── 36-column schema tests ─────────────────────────────────────────────────────
+
+_FACILITY_SCHEMA_ROW = {
+    "id": "1",
+    "site_name": "Site Alpha",
+    "facility_name": "Facility X",
+    "component_name": "Component 1",
+    "category": "Communications",
+    "responsible_body": "Unit 8200",
+    "system": "Comms System A",
+    "support_for_attack_effort": "High",
+    "support_for_defende_control_effort": "Medium",
+    "support_for_intelligence_effort": "High",
+    "support_for_allert_effort": "Low",
+    "support_for_national_effort": "Critical",
+    "ploygon": "POLYGON((34.8 31.9))",
+    "central_point": "34.8,31.9",
+    "details_on_facilty_purpose": "Central coordination node for regional operations",
+    "operational_significance_if_damaged": "Loss will halt 60% of communications",
+    "sop_if_damaged": "Reroute via backup facility Beta",
+    "deffence_with_iron_dome": "Coverage-1",
+    "level_for_deffense_with_upper_layer": "Tier-2",
+    "system_information": "Manages Comms System A and auxiliary Comms B",
+    "component_importance_to_system": "Critical — single point of failure",
+    "hardering": "Level-3",
+    "concelaments": "Camouflage",
+    "sidtibution": "Distributed-2",
+    "recovery_capability": "72h",
+    "redundency": "Yes",
+    "redundency_details": "Backup facility Beta can replace within 3 hours",
+    "primary_backup": "Site Beta",
+    "secondary_primary": "Site Gamma",
+    "mobility": "Non-mobile",
+    "related_facilty": "Facility Y",
+    "connected_power_station": "Power Grid North",
+    "connection_to_strategic_fuel_reserves": "Fuel Reserve 2",
+    "refined_coordinate": "34.8014,31.9259",
+    "site_by_aerial_defense": "Iron Dome Zone 5",
+}
+
+
+def test_detect_column_role_known_schema_site_name():
+    """site_name must be detected as LOCATION_ID in the known 36-column schema."""
+    from services.pipeline.connectors.excel_connector import _detect_column_role
+    from services.pipeline.models.ontology import DetectedColumnRole
+
+    role = _detect_column_role("site_name", [])
+    assert role == DetectedColumnRole.LOCATION_ID, (
+        f"'site_name' must be LOCATION_ID (known schema). Got: {role}"
+    )
+
+
+def test_detect_column_role_known_schema_free_text():
+    """Free-text columns in the known schema must be detected as FREE_TEXT."""
+    from services.pipeline.connectors.excel_connector import _detect_column_role
+    from services.pipeline.models.ontology import DetectedColumnRole
+
+    for col in ["details_on_facilty_purpose", "operational_significance_if_damaged", "sop_if_damaged"]:
+        role = _detect_column_role(col, [])
+        assert role == DetectedColumnRole.FREE_TEXT, (
+            f"'{col}' must be FREE_TEXT (known schema). Got: {role}"
+        )
+
+
+def test_detect_column_role_known_schema_structured_ref():
+    """Structured-ref columns (primary_backup, related_facilty, etc.) must be STRUCTURED_REF."""
+    from services.pipeline.connectors.excel_connector import _detect_column_role
+    from services.pipeline.models.ontology import DetectedColumnRole
+
+    for col in ["primary_backup", "secondary_primary", "related_facilty", "connected_power_station"]:
+        role = _detect_column_role(col, [])
+        assert role == DetectedColumnRole.STRUCTURED_REF, (
+            f"'{col}' must be STRUCTURED_REF (known schema). Got: {role}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_facility_schema_detection_known_columns():
+    """Schema detection on the 36-column schema must map site_name to location column."""
+    from services.pipeline.connectors.excel_connector import ExcelConnector
+
+    path = _write_excel_tempfile([_FACILITY_SCHEMA_ROW])
+    try:
+        connector = ExcelConnector(file_path=path)
+        schema = await connector.detect_schema()
+
+        assert schema.location_column == "site_name", (
+            f"Expected 'site_name' as location column for 36-col schema. Got: {schema.location_column!r}"
+        )
+        # Detection confidence should be high for the known schema
+        assert schema.detection_confidence >= 0.8, (
+            f"Expected high confidence (≥0.8) for known schema. Got: {schema.detection_confidence:.2f}"
+        )
+    finally:
+        import os
+        os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_facility_schema_raw_content_structure():
+    """list_documents must emit structured_refs, categoricals, free_texts, geos in raw_content."""
+    from services.pipeline.connectors.excel_connector import ExcelConnector
+
+    path = _write_excel_tempfile([_FACILITY_SCHEMA_ROW])
+    try:
+        connector = ExcelConnector(file_path=path)
+        schema = await connector.detect_schema()
+
+        docs = []
+        async for doc in connector.list_documents(schema_overrides=schema):
+            docs.append(doc)
+
+        assert len(docs) == 1, f"Expected 1 document, got {len(docs)}"
+        raw = docs[0].raw_content
+
+        # Core identity fields
+        assert raw["site_name"] == "Site Alpha"
+        assert raw["facility_name"] == "Facility X"
+        assert raw["component_name"] == "Component 1"
+
+        # Structured refs must be in structured_refs dict
+        assert "primary_backup" in raw.get("structured_refs", {}), (
+            "primary_backup must be in structured_refs dict in raw_content"
+        )
+        assert raw["structured_refs"]["primary_backup"] == "Site Beta", (
+            f"structured_refs[primary_backup] must be 'Site Beta'. Got: {raw['structured_refs'].get('primary_backup')!r}"
+        )
+
+        # Free-text columns must be in free_texts dict
+        free_texts = raw.get("free_texts", {})
+        assert len(free_texts) > 0, "free_texts dict must be populated for 36-col rows"
+
+        # Geo columns must be in geos dict
+        geos = raw.get("geos", {})
+        assert len(geos) > 0, "geos dict must be populated for 36-col rows"
+
+    finally:
+        import os
+        os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_facility_schema_no_silent_discards_complete_row():
+    """A fully populated 36-column row must be committed (review_needed=False)."""
+    from services.pipeline.connectors.excel_connector import ExcelConnector
+
+    path = _write_excel_tempfile([_FACILITY_SCHEMA_ROW])
+    try:
+        connector = ExcelConnector(file_path=path)
+        schema = await connector.detect_schema()
+
+        docs = []
+        async for doc in connector.list_documents(schema_overrides=schema):
+            docs.append(doc)
+
+        assert len(docs) == 1
+        assert not docs[0].raw_content.get("review_needed"), (
+            "A complete row with site_name must not require review"
+        )
+        assert len(connector.review_queue) == 0, (
+            f"Review queue must be empty for a valid row. Got {len(connector.review_queue)} items"
+        )
+    finally:
+        import os
+        os.unlink(path)

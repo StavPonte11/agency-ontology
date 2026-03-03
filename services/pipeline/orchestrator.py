@@ -119,7 +119,7 @@ class PipelineOrchestrator:
         return self._es
 
     def _get_extractor(self):
-        """Lazily create and cache the LLMExtractor."""
+        """Lazily create and cache the LLMExtractor (uses ChatOpenAI)."""
         if self._extractor is None:
             from .processors.llm_extractor import LLMExtractor
             self._extractor = LLMExtractor(
@@ -127,7 +127,7 @@ class PipelineOrchestrator:
                 model=self._model,
                 langfuse_client=self._langfuse,
                 max_retries=self._max_retries,
-                base_url=self._ollama_base_url,  # None → OpenAI; set → Ollama
+                base_url=self._ollama_base_url,  # None → OpenAI; set → Ollama-compatible endpoint
             )
         return self._extractor
 
@@ -362,5 +362,218 @@ class PipelineOrchestrator:
         logger.info(
             f"Directory run complete: {len(results)} docs, "
             f"{total_concepts} concepts, {total_rels} relationships ingested."
+        )
+        return results
+
+    async def run_excel(
+        self,
+        file_path: str,
+        sheet_name: Optional[str | int] = 0,
+        connector_id: str = "excel-impact",
+        llm_extraction: bool = True,
+        schema_overrides: Optional[Any] = None,
+    ) -> Any:  # ExcelIngestionResult
+        """
+        Run the full impact ingestion pipeline on a single Excel file.
+
+        Reads the file using ExcelConnector with column-aware schema detection,
+        then for each row:
+          1. Ingests Site / Facility / Component nodes and structured edges
+             directly into Neo4j (no LLM needed for these).
+          2. Optionally calls FacilityRowImpactExtractor on free-text columns
+             to extract additional typed edges.
+        """
+        from .models.ontology import ExcelIngestionResult
+        from .connectors.excel_connector import ExcelConnector, FacilityRowImpactExtractor
+
+        start = time.monotonic()
+        path = Path(file_path)
+
+        if not path.exists():
+            logger.error(f"Excel file not found: {file_path}")
+            return ExcelIngestionResult(
+                file_name=str(file_path),
+                total_rows=0,
+                committed_rows=0,
+                review_queue_rows=0,
+                new_entities=0,
+                updated_entities=0,
+                new_edges=0,
+                entity_resolution_matched=0,
+                entity_resolution_new=0,
+                entity_resolution_ambiguous=0,
+                errors=[f"File not found: {file_path}"],
+            )
+
+        connector = ExcelConnector(
+            file_path=file_path,
+            connector_id=connector_id,
+            sheet_name=sheet_name,
+        )
+
+        # ── Step 1: Schema detection ──────────────────────────────────────────
+        if schema_overrides:
+            schema = schema_overrides
+            logger.info(f"Using provided schema overrides for '{file_path}'")
+        else:
+            schema = await connector.detect_schema()
+            logger.info(
+                f"Schema detected: location_col='{schema.location_column}' "
+                f"dep_cols={schema.dependency_columns} "
+                f"confidence={schema.detection_confidence:.2f}"
+            )
+            if schema.warnings:
+                for w in schema.warnings:
+                    logger.warning(f"Schema warning: {w}")
+
+        # ── Step 2: Set up ChatOpenAI extractor (if LLM extraction requested) ─
+        impact_extractor = None
+        if llm_extraction:
+            try:
+                from langchain_openai import ChatOpenAI
+
+                llm_kwargs: dict[str, Any] = {
+                    "model": self._model,
+                    "temperature": 0.0,
+                    "api_key": self._openai_api_key or "ollama",
+                }
+                if self._ollama_base_url:
+                    # Ollama exposes an OpenAI-compatible endpoint — just point base_url
+                    llm_kwargs["base_url"] = self._ollama_base_url
+
+                llm_client = ChatOpenAI(**llm_kwargs)
+                impact_extractor = FacilityRowImpactExtractor(llm_client)
+                backend = self._ollama_base_url or "OpenAI"
+                logger.info(f"FacilityRowImpactExtractor → ChatOpenAI (backend={backend}, model={self._model})")
+            except Exception as exc:
+                logger.warning(
+                    f"Could not initialize ChatOpenAI extractor: {exc}. "
+                    "Proceeding with structured-only ingestion (no free-text edges)."
+                )
+
+        # ── Step 3: Ingest each row ───────────────────────────────────────────
+        ingestor = await self._get_ingestor()
+
+        total_rows = 0
+        committed_rows = 0
+        review_queue_rows = 0
+        total_nodes = 0
+        total_edges = 0
+        errors: list[str] = []
+
+        async for doc in connector.list_documents(schema_overrides=schema):
+            total_rows += 1
+            raw = doc.raw_content
+
+            if raw.get("review_needed"):
+                review_queue_rows += 1
+                logger.debug(
+                    f"Row {raw.get('row_index')} queued for review: {raw.get('review_reason')}"
+                )
+
+            # ── LLM free-text extraction ──────────────────────────────────────
+            llm_result = None
+            if impact_extractor and raw.get("free_texts"):
+                try:
+                    llm_result = await impact_extractor.extract(
+                        site_name=raw.get("site_name", ""),
+                        facility_name=raw.get("facility_name", ""),
+                        component_name=raw.get("component_name", ""),
+                        free_texts=raw.get("free_texts", {}),
+                    )
+                    if llm_result.review_needed:
+                        logger.debug(
+                            f"LLM extraction flagged row {raw.get('row_index')} "
+                            f"for review: {llm_result.review_reason}"
+                        )
+                except Exception as exc:
+                    logger.warning(f"LLM extraction failed for row {raw.get('row_index')}: {exc}")
+
+            # ── Graph ingestion (structured + LLM) ───────────────────────────
+            try:
+                row_stats = await ingestor.ingest_impact_row(
+                    row_content=raw,
+                    source_file=file_path,
+                    llm_extraction=llm_result,
+                )
+                total_nodes += row_stats.get("nodes", 0)
+                total_edges += row_stats.get("edges", 0)
+                if row_stats.get("errors", 0):
+                    errors.append(f"Row {raw.get('row_index')}: {row_stats['errors']} edge error(s)")
+                else:
+                    committed_rows += 1
+            except Exception as exc:
+                logger.error(f"Row {raw.get('row_index')} ingestion failed: {exc}")
+                errors.append(f"Row {raw.get('row_index')}: ingestion failed: {exc}")
+
+        duration = time.monotonic() - start
+        logger.info(
+            f"\n{'='*60}\n"
+            f"  Excel Pipeline COMPLETE: {path.name!r}\n"
+            f"  Total rows     : {total_rows}\n"
+            f"  Committed rows : {committed_rows}\n"
+            f"  Review queue   : {review_queue_rows}\n"
+            f"  Nodes created  : {total_nodes}\n"
+            f"  Edges created  : {total_edges}\n"
+            f"  Review queue sz: {len(connector.review_queue)}\n"
+            f"  Duration       : {duration:.1f}s\n"
+            + '='*60
+        )
+
+        return ExcelIngestionResult(
+            file_name=path.name,
+            total_rows=total_rows,
+            committed_rows=committed_rows,
+            review_queue_rows=len(connector.review_queue),
+            new_entities=total_nodes,
+            updated_entities=0,
+            new_edges=total_edges,
+            entity_resolution_matched=0,
+            entity_resolution_new=total_nodes,
+            entity_resolution_ambiguous=review_queue_rows,
+            errors=errors,
+            duration_seconds=duration,
+        )
+
+    async def run_excel_directory(
+        self,
+        directory: str,
+        glob_pattern: str = "**/*.xlsx",
+        connector_id: str = "excel-impact",
+        llm_extraction: bool = True,
+    ) -> list[Any]:  # list[ExcelIngestionResult]
+        """
+        Run the Excel impact pipeline on all .xlsx files in a directory.
+        """
+        root = Path(directory)
+        if not root.exists():
+            logger.error(f"Directory not found: {directory}")
+            return []
+
+        excel_paths = sorted(root.glob(glob_pattern))
+        if not excel_paths:
+            logger.warning(f"No Excel files found in {directory!r} with pattern {glob_pattern!r}")
+            return []
+
+        logger.info(f"Processing {len(excel_paths)} Excel files from {directory!r}")
+
+        results = []
+        for excel_path in excel_paths:
+            result = await self.run_excel(
+                file_path=str(excel_path),
+                connector_id=connector_id,
+                llm_extraction=llm_extraction,
+            )
+            results.append(result)
+            logger.info(
+                f"  {excel_path.name}: {result.committed_rows}/{result.total_rows} rows committed, "
+                f"{result.new_edges} edges"
+            )
+
+        total_edges = sum(r.new_edges for r in results)
+        total_nodes = sum(r.new_entities for r in results)
+        logger.info(
+            f"Excel directory run complete: {len(results)} files, "
+            f"{total_nodes} nodes, {total_edges} edges ingested."
         )
         return results
