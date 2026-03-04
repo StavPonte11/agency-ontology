@@ -663,6 +663,8 @@ class RelatedConceptRef(BaseModel):
     relation: str
     direction: str  # "outbound" | "inbound"
     confidence: Confidence
+    weight: Optional[float] = None
+    meaning: Optional[str] = None
 
 
 class DataAssetRef(BaseModel):
@@ -1304,9 +1306,11 @@ class ExtractedImpactEdge(BaseModel):
     edge_type: str = Field(
         description=(
             "Edge type: CONTAINS | PART_OF_SYSTEM | OPERATED_BY | POWERED_BY | FUELED_BY | "
-            "PROTECTED_BY | AERIAL_DEFENSE_ZONE | RELATED_TO | BACKUP_FOR | AFFECTS | USES"
+            "PROTECTED_BY | AERIAL_DEFENSE_ZONE | RELATED_TO | BACKUP_FOR | AFFECTS | USES | SUPPORTS"
         )
     )
+    weight: Optional[float] = Field(default=None, description="Numerical weight for this edge, usually between 0.0 and 1.0, or absolute integer weight")
+    meaning: Optional[str] = Field(default=None, description="The meaning of the weight (e.g. urgency, importance, support effort)")
     criticality: str = Field(default="MEDIUM", description="CRITICAL | HIGH | MEDIUM | LOW")
     notes: Optional[str] = None
     source_column: str = Field(description="Name of the column this edge was extracted from")
@@ -1324,6 +1328,18 @@ class FacilityRowExtractionOutput(BaseModel):
             "All dependency edges extracted from the free-text columns. "
             "Each edge describes a relationship between entities mentioned in the text."
         )
+    )
+    nodes: list[ExtractedConcept] = Field(
+        default_factory=list,
+        description="Any new explicit entities discovered entirely within the free text that are not the existing site/facility/component."
+    )
+    normalized_categoricals: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Normalized categorical values parsed from the row's raw values (e.g., standardizing text into clear boolean or enum categories)"
+    )
+    geo_data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Processed and normalized geographic data extracted from polygon, central_point, or refined_coordinate columns"
     )
     entity_refs: list[str] = Field(
         default_factory=list,

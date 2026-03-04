@@ -317,7 +317,7 @@ ON CREATE SET
     f.centralPoint                = $central_point,
     f.refinedCoordinate           = $refined_coordinate,
     f.operationalSignificance     = $operational_significance,
-    f.mitigation_procedures        = $mitigation_procedures,
+    f.mitigation_procedures       = $mitigation_procedures,
     f.sourceFile                  = $source_file,
     f.createdAt                   = datetime()
 ON MATCH SET
@@ -325,7 +325,10 @@ ON MATCH SET
     f.responsibleBody         = CASE WHEN $responsible_body <> '' THEN $responsible_body ELSE f.responsibleBody END,
     f.defenceWithIronDome     = CASE WHEN $defence_iron_dome <> '' THEN $defence_iron_dome ELSE f.defenceWithIronDome END,
     f.operationalSignificance = CASE WHEN $operational_significance IS NOT NULL THEN $operational_significance ELSE f.operationalSignificance END,
-    f.mitigation_procedures    = CASE WHEN $mitigation_procedures IS NOT NULL THEN $mitigation_procedures ELSE f.mitigation_procedures END
+    f.mitigation_procedures   = CASE WHEN $mitigation_procedures IS NOT NULL THEN $mitigation_procedures ELSE f.mitigation_procedures END,
+    f.polygon                 = CASE WHEN $polygon IS NOT NULL THEN $polygon ELSE f.polygon END,
+    f.centralPoint            = CASE WHEN $central_point IS NOT NULL THEN $central_point ELSE f.centralPoint END,
+    f.refinedCoordinate       = CASE WHEN $refined_coordinate IS NOT NULL THEN $refined_coordinate ELSE f.refinedCoordinate END
 RETURN f.name AS facility_name
 """
 
@@ -466,20 +469,40 @@ class GraphIngestor:
             if (await res.single()):
                 stats["nodes"] += 1
 
+            # Resolve Geo Data & Normalized Categoricals from LLM Output OR Raw Properties
+            geo_data = llm_extraction.geo_data if llm_extraction and hasattr(llm_extraction, "geo_data") else {}
+            norm_cats = llm_extraction.normalized_categoricals if llm_extraction and hasattr(llm_extraction, "normalized_categoricals") else {}
+
+            polygon = geo_data.get("polygon") or row_content.get("geos", {}).get("polygon", "")
+            central_point = geo_data.get("central_point") or row_content.get("geos", {}).get("central_point", "")
+            refined_coordinate = geo_data.get("refined_coordinate") or row_content.get("geos", {}).get("refined_coordinate", "")
+            
+            defence_iron_dome = norm_cats.get("defence_with_iron_dome")
+            if defence_iron_dome is None:
+                defence_iron_dome = categoricals.get("defence_with_iron_dome", "")
+
             # 2. Merge Facility
             res = await session.run("""
                 MERGE (f:Facility {name: $facility_name, site_name: $site_name})
                 ON CREATE SET 
                     f.id = randomUUID(), 
                     f.createdAt = datetime(),
-                    f.source_file = $source_file
+                    f.source_file = $source_file,
+                    f.polygon = $polygon,
+                    f.centralPoint = $central_point,
+                    f.refinedCoordinate = $refined_coordinate,
+                    f.defenceWithIronDome = $defence_iron_dome
                 SET f.category = $category
                 RETURN f.id AS id
             """, 
             facility_name=facility_name, 
             site_name=site_name,
             source_file=source_file,
-            category=categoricals.get("category", "") or "Unknown")
+            category=categoricals.get("category", "") or "Unknown",
+            polygon=polygon,
+            central_point=central_point,
+            refined_coordinate=refined_coordinate,
+            defence_iron_dome=str(defence_iron_dome))
             if (await res.single()):
                 stats["nodes"] += 1
 
@@ -538,16 +561,23 @@ class GraphIngestor:
                 if edge_type == "OPERATED_BY": target_label = "Department"
                 elif edge_type == "PART_OF_SYSTEM": target_label = "System"
                 
-                res = await session.run(f"""
-                    MERGE (t:{target_label} {{name: $target}})
-                    ON CREATE SET t.id = randomUUID(), t.createdAt = datetime()
-                    WITH t
-                    MATCH (src:{source_node_type} {{name: $src_name {fac_constraint} }})
-                    MERGE (src)-[r:{edge_type}]->(t)
-                    RETURN r
-                """, target=target_value, src_name=source_node_name)
-                if (await res.single()):
-                    stats["edges"] += 1
+                # Split comma/newline-separated lists (like connected_power_station)
+                target_values = [v.strip() for v in str(target_value).replace('\n', ',').split(',')] if ',' in str(target_value) or '\n' in str(target_value) else [str(target_value).strip()]
+                
+                for single_target in target_values:
+                    if not single_target:
+                        continue
+                        
+                    res = await session.run(f"""
+                        MERGE (t:{target_label} {{name: $target}})
+                        ON CREATE SET t.id = randomUUID(), t.createdAt = datetime()
+                        WITH t
+                        MATCH (src:{source_node_type} {{name: $src_name {fac_constraint} }})
+                        MERGE (src)-[r:{edge_type}]->(t)
+                        RETURN r
+                    """, target=single_target, src_name=source_node_name)
+                    if (await res.single()):
+                        stats["edges"] += 1
 
             # 6. Process LLM Extracted Free-Text Edges
             if llm_extraction and getattr(llm_extraction, "edges", None):
@@ -574,18 +604,45 @@ class GraphIngestor:
                             ON CREATE SET 
                                 r.criticality = $crit,
                                 r.source_column = $src_col,
+                                r.weight = $weight,
+                                r.meaning = $meaning,
                                 r.createdAt = datetime()
                             RETURN r
                         """, 
                         from_name=edge.from_entity,
                         to_name=edge.to_entity,
                         crit=edge.criticality or "MEDIUM",
-                        src_col=edge.source_column or "LLM_Extracted")
+                        src_col=edge.source_column or "LLM_Extracted",
+                        weight=edge.weight,
+                        meaning=edge.meaning)
                         
                         if (await res.single()):
                             stats["edges"] += 1
                     except Exception as e:
                         logger.warning(f"Failed to ingest LLM edge {edge.from_entity}-[{clean_type}]->{edge.to_entity}: {e}")
+
+            # 7. Process LLM Extracted Free-Text Nodes
+            if llm_extraction and getattr(llm_extraction, "nodes", None):
+                for node in llm_extraction.nodes:
+                    try:
+                        concept_node_id = await self._ingest_concept(
+                            session, node, source_file, f"manual::{uuid.uuid4()}"
+                        )
+                        if concept_node_id:
+                            stats["nodes"] += 1
+                            
+                            # Create an edge linking this new autonomous node 
+                            # back to the Facility/Component that extracted it
+                            await session.run(f"""
+                                MATCH (src:{source_node_type} {{name: $src_name {fac_constraint} }})
+                                MATCH (n:Concept {{id: $node_id}})
+                                MERGE (src)-[r:MENTIONS_CONCEPT]->(n)
+                                ON CREATE SET r.createdAt = datetime()
+                            """, src_name=source_node_name, node_id=concept_node_id)
+                            stats["edges"] += 1
+                                
+                    except Exception as e:
+                        logger.warning(f"Failed to ingest new LLM node {node.name}: {e}")
 
         return stats
 

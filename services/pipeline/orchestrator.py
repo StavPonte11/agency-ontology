@@ -426,6 +426,9 @@ class PipelineOrchestrator:
                 for w in schema.warnings:
                     logger.warning(f"Schema warning: {w}")
 
+        dataset_context = connector.analyze_dataset(schema)
+        logger.info(f"Dataset global context extracted ({len(dataset_context)} chars).")
+
         # ── Step 2: Set up ChatOpenAI extractor (if LLM extraction requested) ─
         impact_extractor = None
         if llm_extraction:
@@ -442,7 +445,7 @@ class PipelineOrchestrator:
                     llm_kwargs["base_url"] = self._ollama_base_url
 
                 llm_client = ChatOpenAI(**llm_kwargs)
-                impact_extractor = FacilityRowImpactExtractor(llm_client)
+                impact_extractor = FacilityRowImpactExtractor(llm_client, dataset_context=dataset_context)
                 backend = self._ollama_base_url or "OpenAI"
                 logger.info(f"FacilityRowImpactExtractor → ChatOpenAI (backend={backend}, model={self._model})")
             except Exception as exc:

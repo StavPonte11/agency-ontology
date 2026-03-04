@@ -477,7 +477,24 @@ class ExcelConnector(SourceConnector):
             component_name = _get(component_cols[0]) if component_cols else ""
 
             dep_text = " | ".join(_get(col) for col in dep_cols + free_text_cols if _get(col))
-            structured_refs = {col: _get(col) for col in structured_ref_cols if _get(col)}
+            
+            structured_refs = {}
+            for col in structured_ref_cols:
+                val = _get(col)
+                if val:
+                    # Special handling for known array columns like connected_power_station
+                    if col == "connected_power_station" and ("," in val or "\n" in val):
+                        # Split by comma or newline and add as multiple entries if needed, 
+                        # but our graph_ingestor currently expects a single string per dict key.
+                        # For simplicity, we just pass the raw string and let the graph ingestor or downstream handle it, 
+                        # OR we change the graph ingestor. Since graph ingestor expects string, we keep it as string here, 
+                        # but in unstructured we pass it to LLM if needed. Actually, graph ingestor can handle lists if we 
+                        # change it, but let's just use the primary element or assume it's one for now, or split it in ingestor.
+                        # Leaving as is to avoid breaking existing downstream, but we pass it cleanly.
+                        # We will split it in the graph ingestor directly instead.
+                        pass
+                    structured_refs[col] = val
+
             categoricals = {col: _get(col) for col in categorical_cols if _get(col)}
             free_texts = {col: _get(col) for col in free_text_cols if _get(col)}
             geos = {col: _get(col) for col in geo_cols if _get(col)}
@@ -548,13 +565,24 @@ class FacilityRowImpactExtractor:
     """LLM-based extractor for free-text columns."""
 
     _SYSTEM_PROMPT = """\
-You are an expert analyst. Extract dependency edges from free-text fields.
-Identify: from_entity, from_type, to_entity, to_type, edge_type, criticality, source_column.
+You are an expert analyst. Extract dependency edges and new entities from free-text fields.
+Identify: from_entity, from_type, to_entity, to_type, edge_type, criticality, source_column, weight (0.0-1.0), and meaning.
+If there are completely new systems/entities mentioned in the text that act as standalone nodes, add them to `nodes`.
+
+CRITICAL NORMALIZATION REQUIREMENT:
+Extract normalized categorical values and numerical values IN PROPORTION to the global dataset context provided below.
+Ensure the semantics you extract align with the frequency and ranges of the entire dataset.
+
+{dataset_context}
+
+Extract normalized geographic coordinates or polygons into `geo_data`.
 Rules: Extract only explicit/implied info. Use SITE|FACILITY|COMPONENT|SYSTEM types.
+Form weighted edges from numerical 'support_for_x_effort' variables using 'SUPPORTS' as the edge type and assigning the weight/meaning.
 Return empty edges list if nothing found."""
 
-    def __init__(self, llm_client: Any) -> None:
+    def __init__(self, llm_client: Any, dataset_context: str = "") -> None:
         self._chain = llm_client.with_structured_output(FacilityRowExtractionOutput)
+        self._dataset_context = dataset_context or "No global context available."
 
     async def extract(
         self,
@@ -578,9 +606,12 @@ Return empty edges list if nothing found."""
             f"Site: {site_name}\nFacility: {facility_name}\nComponent: {component_name}\n\n"
             f"FIELDS:\n{col_sections}"
         )
+        
+        sys_prompt = self._SYSTEM_PROMPT.replace("{dataset_context}", self._dataset_context)
+
         try:
             result = await self._chain.ainvoke([
-                SystemMessage(content=self._SYSTEM_PROMPT),
+                SystemMessage(content=sys_prompt),
                 HumanMessage(content=human_content),
             ])
             return result

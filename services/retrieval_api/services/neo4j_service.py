@@ -96,13 +96,13 @@ class Neo4jService:
                     # Try full-text index as fallback (lexical)
                     result2 = await session.run(
                         """
-                        CALL db.index.fulltext.queryNodes('concept_fulltext', $query)
+                        CALL db.index.fulltext.queryNodes('concept_fulltext', $search_term)
                         YIELD node, score
                         WHERE node.status <> 'DEPRECATED'
                         RETURN node AS c
                         ORDER BY score DESC LIMIT 1
                         """,
-                        query=term,
+                        search_term=term,
                     )
                     record = await result2.single()
 
@@ -152,20 +152,22 @@ class Neo4jService:
                     MATCH (c:Concept {id: $id})-[r]->(other:Concept)
                     WHERE type(r) IN ['IS_A','PART_OF','DEPENDS_ON','USES','GOVERNS',
                                       'REPLACES','REPORTS_TO','OWNED_BY','PRODUCES',
-                                      'CONSUMES','RELATED_TO']
+                                      'CONSUMES','RELATED_TO','SUPPORTS']
                       AND other.status <> 'DEPRECATED'
                     RETURN other.nameHe AS nameHe, other.name AS name,
                            type(r) AS relation, r.confidence AS conf,
+                           r.weight AS weight, r.meaning AS meaning,
                            'outbound' AS direction
                     LIMIT 20
                     UNION
                     MATCH (other:Concept)-[r]->(c:Concept {id: $id})
                     WHERE type(r) IN ['IS_A','PART_OF','DEPENDS_ON','USES','GOVERNS',
                                       'REPLACES','REPORTS_TO','OWNED_BY','PRODUCES',
-                                      'CONSUMES','RELATED_TO']
+                                      'CONSUMES','RELATED_TO','SUPPORTS']
                       AND other.status <> 'DEPRECATED'
                     RETURN other.nameHe AS nameHe, other.name AS name,
                            type(r) AS relation, r.confidence AS conf,
+                           r.weight AS weight, r.meaning AS meaning,
                            'inbound' AS direction
                     LIMIT 20
                     """,
@@ -173,12 +175,18 @@ class Neo4jService:
                 )
                 related: list[RelatedConceptRef] = []
                 async for row in related_result:
-                    related.append(RelatedConceptRef(
-                        name=row["nameHe"] or row["name"],
-                        relation=row["relation"],
-                        direction=row["direction"],
-                        confidence=float(row["conf"] or 0.7),
-                    ))
+                    rel_data = {
+                        "name": row["nameHe"] or row["name"],
+                        "relation": row["relation"],
+                        "direction": row["direction"],
+                        "confidence": float(row["conf"] or 0.7),
+                    }
+                    if "weight" in row and row["weight"] is not None:
+                        rel_data["weight"] = float(row["weight"])
+                    if "meaning" in row and row["meaning"] is not None:
+                        rel_data["meaning"] = row["meaning"]
+                        
+                    related.append(RelatedConceptRef(**rel_data))
 
                 # Step 4: Get data asset mappings
                 data_assets: list[DataAssetRef] = []
@@ -218,16 +226,34 @@ class Neo4jService:
                 confidence = float(concept_node.get("confidence", 0.7))
 
                 from datetime import datetime as dt
+                
+                # Fetch geo and facility specific data if this is a Facility node
+                geo_data = {}
+                norm_cats = {}
+                if concept_node.get("nodeType") == "FACILITY":
+                    if concept_node.get("polygon") or concept_node.get("centralPoint") or concept_node.get("refinedCoordinate"):
+                        geo_data = {
+                            "polygon": concept_node.get("polygon"),
+                            "central_point": concept_node.get("centralPoint"),
+                            "refined_coordinate": concept_node.get("refinedCoordinate")
+                        }
+                    
+                    if concept_node.get("defenceWithIronDome") is not None:
+                        norm_cats["defence_with_iron_dome"] = concept_node.get("defenceWithIronDome")
+
+                # We inject geo_data and norm_cats dynamically into definition or as a string if 
+                # the schema restricts us, otherwise if LookupResult allowed dicts we'd put it there.
+                expanded_definition = (description + (f" | Geo: {geo_data}" if geo_data else "") + (f" | Attributes: {norm_cats}" if norm_cats else "")) if description else description
 
                 return LookupResult(
                     found=True,
                     concept=ConceptRef(
                         id=concept_id,
                         name=display_name,
-                        concept_type=ConceptType(concept_node["conceptType"]),
+                        concept_type=ConceptType(concept_node.get("conceptType", "ENTITY")),
                         domain=concept_node.get("domain") or [],
                     ),
-                    definition=description,
+                    definition=expanded_definition,
                     aliases=aliases,
                     related=related,
                     data_assets=data_assets,
@@ -241,7 +267,7 @@ class Neo4jService:
                         last_updated=concept_node.get("updatedAt") or dt.utcnow(),
                     ),
                     confidence=confidence,
-                    status=ConceptStatus(concept_node["status"]),
+                    status=ConceptStatus(concept_node.get("status", "CANDIDATE")),
                     low_confidence=confidence < 0.6,
                     degraded_mode=False,
                 )
